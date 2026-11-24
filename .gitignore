@@ -1,0 +1,36 @@
+# Secrets & local environment
+.env
+.env.local
+
+# Python cache & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Backup files & one-off migration/patch scripts
+*.bak
+*.bak2
+*.bak3
+fix_*.py
+update_*.py
+patch_*.py
+app_patch_code.py
+write_app.py
+
+# External benchmark repo (contains nested .git and >10MB index)
+EnterpriseRAG-Bench/
+
+# Generated runtime artifacts & local SQLite cache
+generated_docs/*.docx
+data_cache/*.docx
+data_cache/*.db
+data_cache/*.db-wal
+data_cache/*.db-shm
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

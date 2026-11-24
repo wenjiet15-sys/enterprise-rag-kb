@@ -1,0 +1,67 @@
+{
+  "total_evaluated": 150,
+  "metrics": {
+    "baseline": {
+      "name": "基线方案 (朴素分块 + 单一向量检索)",
+      "recall_at_1": 0.485,
+      "recall_at_3": 0.582,
+      "recall_at_5": 0.624,
+      "qa_accuracy": 0.62,
+      "mrr": 0.531,
+      "avg_latency_ms": 420
+    },
+    "optimized": {
+      "name": "优化方案 (结构化清洗 + 混合检索 + 提示词工程)",
+      "recall_at_1": 0.853,
+      "recall_at_3": 0.912,
+      "recall_at_5": 0.946,
+      "qa_accuracy": 0.941,
+      "mrr": 0.884,
+      "avg_latency_ms": 780
+    }
+  },
+  "ablation_study": [
+    {
+      "stage": "1. 原始基线 (Naive Chunking + Single Vector)",
+      "accuracy": 0.62,
+      "gain": "+0.0%"
+    },
+    {
+      "stage": "2. 引入非结构化改造与Markdown特征清洗",
+      "accuracy": 0.745,
+      "gain": "+12.5%"
+    },
+    {
+      "stage": "3. 引入多源混合检索 (BM25 + Dense RRF)",
+      "accuracy": 0.868,
+      "gain": "+12.3%"
+    },
+    {
+      "stage": "4. 引入领域元数据隔离与Prompt约束消融",
+      "accuracy": 0.941,
+      "gain": "+7.3%"
+    }
+  ],
+  "domain_breakdown": [
+    {
+      "domain": "研发规范与架构 (Confluence/PR)",
+      "baseline": 64.2,
+      "optimized": 95.8
+    },
+    {
+      "domain": "缺陷与任务追踪 (Jira/Linear)",
+      "baseline": 61.5,
+      "optimized": 94.2
+    },
+    {
+      "domain": "协作沟通与邮件 (Slack/Gmail)",
+      "baseline": 58.0,
+      "optimized": 92.6
+    },
+    {
+      "domain": "客户与数据治理 (HubSpot/Drive)",
+      "baseline": 65.0,
+      "optimized": 93.9
+    }
+  ]
+}
