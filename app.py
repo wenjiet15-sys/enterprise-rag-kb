@@ -15,6 +15,13 @@ from src.doc_generator import DocumentGenerator
 from src.intent_router import SessionState
 from src.memory_store import MemoryStore
 from src.memory_manager import MEMORY_CATEGORY_LABELS
+from src.auth_manager import AuthManager
+from src.access_control import (
+    UserContext,
+    ROLE_POLICIES,
+    CLEARANCE_LABELS,
+    SOURCE_TYPE_LABELS,
+)
 from src.generator import MODEL_TIER_PROFILES
 import src.generator as _gen_mod
 
@@ -63,6 +70,80 @@ st.markdown("""
     }
     section[data-testid="stSidebar"] .block-container {
         padding-top: 1.2rem !important;
+        padding-bottom: 0.5rem !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] > div > div[data-testid="stVerticalBlock"] {
+        min-height: calc(100vh - 4.5rem) !important;
+    }
+    /* 侧边栏底部固定用户栏（仿豆包左下角：头像+用户名 ›  退出登录） */
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_footer"] {
+        position: sticky !important;
+        bottom: 0 !important;
+        background-color: #f7f8fa !important;
+        border-top: 1px solid #eceef2 !important;
+        padding: 10px 4px 6px 4px !important;
+        margin-top: auto !important;
+        z-index: 20 !important;
+        flex-wrap: nowrap !important;
+        align-items: center !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] {
+        flex: 1 1 auto !important;
+        min-width: 0 !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] button {
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding: 6px 6px !important;
+        min-height: 36px !important;
+        justify-content: flex-start !important;
+        text-align: left !important;
+        color: #111827 !important;
+        font-size: 13.5px !important;
+        font-weight: 500 !important;
+        border-radius: 10px !important;
+        width: 100% !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] button > div {
+        width: 100% !important;
+        justify-content: flex-start !important;
+        text-align: left !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] button p {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        margin: 0 !important;
+        font-size: 13.5px !important;
+        max-width: 100% !important;
+        display: block !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] button:hover {
+        background-color: #eceef2 !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] button svg,
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_user_profile_pop"] button [data-testid="stIconMaterial"] {
+        display: none !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_logout_btn"] {
+        flex: 0 0 auto !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_logout_btn"] button {
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        padding: 6px 8px !important;
+        min-height: 34px !important;
+        color: #6b7280 !important;
+        font-size: 12.5px !important;
+        font-weight: 500 !important;
+        border-radius: 8px !important;
+        white-space: nowrap !important;
+    }
+    section[data-testid="stSidebar"] [class*="st-key-sidebar_logout_btn"] button:hover {
+        background-color: #fee2e2 !important;
+        color: #dc2626 !important;
     }
 
     /* 顶部居中标题栏（仿豆包顶栏） */
@@ -169,6 +250,64 @@ st.markdown("""
         border-radius: 6px;
         font-size: 11.5px;
         font-weight: 500;
+    }
+    .ai-mode-pill-deny {
+        background-color: #fef2f2;
+        color: #dc2626;
+        border: 1px solid #fecaca;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 11.5px;
+        font-weight: 600;
+    }
+    .ai-mode-pill-shield {
+        background-color: #fffbeb;
+        color: #b45309;
+        padding: 2px 8px;
+        border-radius: 6px;
+        font-size: 11.5px;
+        font-weight: 500;
+    }
+    .user-profile-card {
+        background-color: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 10px 12px;
+        margin-bottom: 10px;
+    }
+    .user-profile-name {
+        font-size: 14px;
+        font-weight: 600;
+        color: #111827;
+    }
+    .user-profile-meta {
+        font-size: 11.5px;
+        color: #6b7280;
+        margin-top: 2px;
+    }
+    .role-badge {
+        display: inline-block;
+        background-color: #eef2ff;
+        color: #3730a3;
+        padding: 1px 7px;
+        border-radius: 6px;
+        font-size: 11px;
+        font-weight: 600;
+        margin-top: 5px;
+    }
+    .login-card-header {
+        text-align: center;
+        padding: 24px 0 12px 0;
+    }
+    .login-card-title {
+        font-size: 24px;
+        font-weight: 700;
+        color: #111827;
+        margin-bottom: 6px;
+    }
+    .login-card-sub {
+        font-size: 13.5px;
+        color: #6b7280;
     }
     .mem-card {
         background-color: #fafafa;
@@ -433,18 +572,93 @@ def load_memory_store():
     return MemoryStore()
 
 
+@st.cache_resource
+def load_auth_manager(_engine):
+    return AuthManager(_engine)
+
+
 pipeline = load_pipeline()
 pipeline.generator = _gen_mod.DeepSeekGenerator()
 doc_gen = load_doc_generator()
 memory_store = load_memory_store()
+auth_manager = load_auth_manager(memory_store.engine)
 pipeline.attach_memory(memory_store)
-CURRENT_USER_ID = "default_user"
+pipeline.attach_auth(auth_manager)
+
+
+def _logout_current_user():
+    """退出当前员工登录并清空前端会话缓存"""
+    for k in ("current_user", "session_state", "session_owner_id", "turn_extras", "last_result", "last_level", "gen_doc_path", "gen_doc_md"):
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+def _render_login_page():
+    """未认证时的员工统一登录门禁页（Fail-Closed，未登录禁止渲染知识库与侧边栏）"""
+    st.markdown("""
+    <style>
+        section[data-testid="stSidebar"] { display: none !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    _, center_col, _ = st.columns([1, 1.5, 1])
+    with center_col:
+        st.markdown("""
+        <div class="login-card-header">
+            <div class="login-card-title">🔐 企业智能知识库 · 员工认证</div>
+            <div class="login-card-sub">RBAC 角色隔离 · 检索前强权限过滤 · 全链路安全审计</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.container(border=True):
+            with st.form("employee_login_form", border=False):
+                uname = st.text_input("员工账号", placeholder="请输入账号（例如 dev_zhang）")
+                pwd = st.text_input("登录密码", type="password", placeholder="请输入密码")
+                submitted = st.form_submit_button("登 录", type="primary", use_container_width=True)
+
+            if submitted:
+                user_ctx, err_msg = auth_manager.authenticate(uname, pwd)
+                if user_ctx is not None:
+                    _logout_current_user()
+                    st.session_state["current_user"] = user_ctx.to_dict()
+                    st.rerun()
+                else:
+                    st.error(err_msg)
+
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+        with st.expander("🧪 内置测试账号（用于体验跨角色权限隔离与防越权拦截）", expanded=True):
+            st.markdown(
+                "| 账号 | 密码 | 角色 | 密级 | 允许访问数据源 |\n"
+                "| :--- | :--- | :--- | :---: | :--- |\n"
+                "| `admin` | `admin123` | 系统管理员 | L4 | 全部 9 大数据源 + 权限与审计后台 |\n"
+                "| `dev_zhang` | `dev123` | 研发工程师 | L2 | Confluence / GitHub / Jira / Linear / Slack / Drive（**禁 HubSpot/Gmail/Fireflies**） |\n"
+                "| `sales_li` | `sales123` | 商务/销售 | L2 | HubSpot / Gmail / Confluence / Drive（**禁 GitHub/Jira/Linear**） |\n"
+                "| `intern_wang` | `intern123` | 实习生/访客 | L1 | 仅 L1 公开级 Confluence（**禁其余 8 源 / 禁 Level 3 / 禁导出**） |"
+            )
+
+
+# 强制身份认证门禁
+if "current_user" not in st.session_state:
+    _render_login_page()
+    st.stop()
+
+# 每次刷新从 MySQL 实时校验账号有效性与最新权限（管理员改角色/禁用账号立刻生效）
+_fresh_user = auth_manager.get_user_by_id(st.session_state["current_user"]["user_id"])
+if _fresh_user is None or not _fresh_user.is_active:
+    _logout_current_user()
+    st.warning("当前账号已失效或被管理员禁用，请重新登录。")
+    st.rerun()
+
+current_user: UserContext = _fresh_user
+st.session_state["current_user"] = current_user.to_dict()
+CURRENT_USER_ID = current_user.user_id
 
 
 def _create_new_session():
     """创建一个全新的空白会话（不销毁已有历史会话）"""
     new_sid = f"sess_{uuid.uuid4().hex[:10]}"
     st.session_state["session_state"] = SessionState(session_id=new_sid)
+    st.session_state["session_owner_id"] = CURRENT_USER_ID
     st.session_state["turn_extras"] = {}
     if "last_result" in st.session_state:
         del st.session_state["last_result"]
@@ -452,7 +666,7 @@ def _create_new_session():
 
 @st.dialog("重命名对话", width="small")
 def _open_rename_dialog(target_sid: str, current_title: str):
-    """点击「重命名」后弹出的独立重命名对话框（支持按 Enter 直接保存）"""
+    """点击「重命名」后弹出的独立重命名对话框（支持按 Enter 直接保存，强制校验 user_id 防越权）"""
     with st.form(key=f"rename_dialog_form_{target_sid}", border=False):
         new_title = st.text_input(
             "请输入新的对话名称",
@@ -471,7 +685,7 @@ def _open_rename_dialog(target_sid: str, current_title: str):
         if save_clicked:
             clean_t = (new_title or "").strip()
             if clean_t:
-                memory_store.rename_session(target_sid, clean_t)
+                memory_store.rename_session(target_sid, clean_t, user_id=CURRENT_USER_ID)
                 active_sess = st.session_state.get("session_state")
                 if active_sess is not None and active_sess.session_id == target_sid:
                     active_sess.title = clean_t
@@ -481,20 +695,21 @@ def _open_rename_dialog(target_sid: str, current_title: str):
 
 
 def _switch_session(session_id: str) -> bool:
-    """从 MySQL 持久化层恢复指定历史会话及其每轮检索/推理详情"""
-    loaded = memory_store.load_session(session_id)
+    """从 MySQL 持久化层恢复当前员工自己的指定历史会话（强制校验 user_id 防 IDOR）"""
+    loaded = memory_store.load_session(session_id, user_id=CURRENT_USER_ID)
     if loaded is None:
         return False
     loaded_session, loaded_extras = loaded
     st.session_state["session_state"] = loaded_session
+    st.session_state["session_owner_id"] = CURRENT_USER_ID
     st.session_state["turn_extras"] = loaded_extras
     if "last_result" in st.session_state:
         del st.session_state["last_result"]
     return True
 
 
-# 初始化全局会话状态（页面刷新后自动恢复最近一次持久化会话）
-if "session_state" not in st.session_state:
+# 初始化当前登录员工的会话状态（切换账号或首次登录时自动隔离并加载本人最近会话）
+if "session_state" not in st.session_state or st.session_state.get("session_owner_id") != CURRENT_USER_ID:
     saved_sessions = memory_store.list_sessions(user_id=CURRENT_USER_ID, limit=1)
     if saved_sessions and _switch_session(saved_sessions[0]["session_id"]):
         pass
@@ -510,18 +725,19 @@ def process_user_message(
     user_text: str,
     mode_key: str,
     top_k: int,
-    domain_arg,
+    source_arg,
     use_ltm: bool = True,
     auto_extract_ltm: bool = True,
 ):
-    """处理用户发送的消息，并将结果事务增量持久化到 MySQL 与上方对话流"""
+    """处理当前员工发送的消息，透传 UserContext 执行检索前权限过滤并落库 MySQL"""
     res = pipeline.answer_question(
         query=user_text.strip(),
         mode=mode_key,
         top_k=top_k,
-        domain_filter=domain_arg,
+        source_filter=source_arg,
         session=session,
         user_id=CURRENT_USER_ID,
+        user_ctx=current_user,
         use_long_term_memory=use_ltm,
         auto_extract_memory=auto_extract_ltm,
     )
@@ -535,6 +751,8 @@ def process_user_message(
     st.session_state["turn_extras"][current_turn_idx] = {
         "docs": res.get("docs", []),
         "skipped_retrieval": res.get("skipped_retrieval", False),
+        "access_denied": res.get("access_denied", False),
+        "blocked_docs_count": res.get("blocked_docs_count", 0),
         "reasoning_content": res.get("reasoning_content", ""),
         "tool_traces": res.get("tool_traces", []),
         "conflict_matrix": res.get("conflict_matrix", []),
@@ -552,33 +770,34 @@ def process_user_message(
 
 
 # =====================================================================
-# 左侧导航栏（仿豆包极简侧边栏）
+# 左侧导航栏（仿豆包极简侧边栏 + 员工身份名片 + 角色动态菜单）
 # =====================================================================
 with st.sidebar:
     st.markdown("""
     <div style="display:flex; align-items:center; justify-content:space-between; padding: 2px 4px 12px 4px;">
         <span style="font-size: 18px; font-weight: 700; color: #111827;">💬 智能助手</span>
-        <span style="font-size: 11.5px; color: #9ca3af;">DeepSeek & RAG</span>
+        <span style="font-size: 11.5px; color: #9ca3af;">RBAC & RAG</span>
     </div>
     """, unsafe_allow_html=True)
 
-    # 豆包风格「+ 新对话」按钮（保留历史会话，仅开启新对话）
+    # 豆包风格全宽「+ 新对话」按钮
     if st.button("➕  新对话", type="primary", use_container_width=True):
         _create_new_session()
         st.rerun()
 
     st.markdown("<div style='height: 6px;'></div>", unsafe_allow_html=True)
 
+    # 角色动态裁剪导航菜单
     page = st.radio(
         "工作台导航",
-        ["💬 主对话", "🧠 记忆管理", "📑 文档自动化生成", "📊 评测基准与算力消融", "🗂️ 多源知识库画像"],
+        current_user.allowed_pages,
         index=0,
         label_visibility="collapsed"
     )
 
     st.divider()
 
-    # MySQL 持久化多会话历史列表（支持搜索、点击切换、重命名与删除）
+    # MySQL 持久化多会话历史列表（仅展示当前登录员工本人的会话）
     session_search_kw = st.text_input(
         "搜索历史会话",
         value="",
@@ -591,7 +810,7 @@ with st.sidebar:
         limit=25,
         keyword=session_search_kw
     )
-    st.caption(f"历史会话 ({len(saved_sessions)}) · MySQL 已连接")
+    st.caption(f"我的历史会话 ({len(saved_sessions)}) · MySQL")
     if not saved_sessions:
         st.markdown("<div style='font-size:12.5px; color:#9ca3af; padding:4px 0;'>暂无匹配的历史会话</div>", unsafe_allow_html=True)
     else:
@@ -621,7 +840,7 @@ with st.sidebar:
                         _open_rename_dialog(sid, raw_title)
 
                     if st.button("🗑️  删除", key=f"pop_del_sess_{sid}", type="tertiary", use_container_width=True):
-                        memory_store.delete_session(sid)
+                        memory_store.delete_session(sid, user_id=CURRENT_USER_ID)
                         if is_active:
                             remaining = memory_store.list_sessions(user_id=CURRENT_USER_ID, limit=1)
                             if remaining:
@@ -632,9 +851,9 @@ with st.sidebar:
 
     st.divider()
 
-    # 知识库检索与记忆设置收起在侧边栏折叠项中，保持界面干净
+    # 知识库检索与记忆设置（数据源过滤仅展示当前角色已授权的数据源）
     with st.expander("⚙️ 知识库检索与记忆设置", expanded=False):
-        use_ltm = st.toggle("启用跨会话长期记忆召回", value=True, help="自动将 MySQL 中的用户画像、偏好与相关记忆注入上下文")
+        use_ltm = st.toggle("启用跨会话长期记忆召回", value=True, help="自动将 MySQL 中的个人画像、偏好与相关记忆注入上下文")
         auto_extract_ltm = st.toggle("启用高信号自动抽取记忆", value=True, help="仅对自我介绍、偏好、项目背景等高信号发言触发轻量抽取")
         st.divider()
         retrieval_mode = st.selectbox(
@@ -643,11 +862,34 @@ with st.sidebar:
         )
         mode_key = retrieval_mode.split()[0]
         top_k = st.slider("检索文档数 Top-K", min_value=1, max_value=8, value=4)
-        domain_filter = st.selectbox(
-            "业务域过滤",
-            ["全部业务域", "研发与工程", "运维规范", "客户治理", "日常协同", "综合行政"]
+
+        authorized_sources = sorted(current_user.allowed_sources)
+        source_options = ["all"] + authorized_sources
+        selected_source = st.selectbox(
+            "数据源过滤（仅显示已授权）",
+            options=source_options,
+            format_func=lambda s: f"全部已授权 ({len(authorized_sources)} 源)" if s == "all" else SOURCE_TYPE_LABELS.get(s, s),
         )
-        domain_arg = None if domain_filter == "全部业务域" else domain_filter
+        source_arg = None if selected_source == "all" else selected_source
+
+    # 侧边栏底部固定用户栏（参考豆包左下角：头像+用户名 ›  退出登录）
+    with st.container(key="sidebar_user_footer", horizontal=True, vertical_alignment="center", gap="small"):
+        with st.popover(
+            f"👤 {current_user.display_name} ›",
+            key="sidebar_user_profile_pop",
+            type="tertiary",
+            width="stretch",
+            help="点击查看当前账号角色与授权范围",
+        ):
+            st.markdown(f"**{current_user.display_name}** (`@{current_user.username}`)")
+            st.caption(f"{current_user.department} · {current_user.role_name} · {current_user.clearance_label}")
+            st.markdown("<hr style='margin: 6px 0; border: none; border-top: 1px solid #f1f5f9;'>", unsafe_allow_html=True)
+            st.caption(f"已授权数据源 ({len(authorized_sources)})：")
+            st.markdown(f"`{'` `'.join(authorized_sources)}`")
+
+        if st.button("退出登录", key="sidebar_logout_btn", type="tertiary", help="退出登录并切换其他员工账号"):
+            _logout_current_user()
+            st.rerun()
 
 
 # =====================================================================
@@ -701,7 +943,7 @@ if page == "💬 主对话":
                 with target_col:
                     if st.button(label, key=f"quick_q_{idx}", use_container_width=True):
                         with st.spinner("思考中..."):
-                            process_user_message(q_text, mode_key, top_k, domain_arg, use_ltm=use_ltm, auto_extract_ltm=auto_extract_ltm)
+                            process_user_message(q_text, mode_key, top_k, source_arg, use_ltm=use_ltm, auto_extract_ltm=auto_extract_ltm)
                         st.rerun()
 
         else:
@@ -719,6 +961,8 @@ if page == "💬 主对话":
                 extras = st.session_state["turn_extras"].get(t_num, {})
                 recalled_mems = extras.get("recalled_memories", [])
                 mem_events = extras.get("memory_events", [])
+                is_denied = extras.get("access_denied", False) or (t_stage == "权限拦截拒答")
+                blocked_cnt = int(extras.get("blocked_docs_count", 0) or 0)
 
                 # 1. 用户消息（右对齐浅灰圆角气泡，与豆包一致）
                 st.markdown(f"""
@@ -739,15 +983,21 @@ if page == "💬 主对话":
                 st.markdown('<div class="ai-msg-container">', unsafe_allow_html=True)
                 st.markdown(t_ans)
 
-                # 底部轻量状态行（模式徽章 + 记忆召回/写入胶囊 + 耗时）
-                if t_stage == "长期记忆指令":
+                # 底部轻量状态行（模式徽章 + 权限过滤/拦截胶囊 + 记忆召回/写入胶囊 + 耗时）
+                if is_denied:
+                    mode_badge = '<span class="ai-mode-pill-deny">🔒 权限不足拦截 · 已记入审计</span>'
+                elif t_stage == "长期记忆指令":
                     mode_badge = '<span class="ai-mode-pill-mem-write">🧠 长期记忆引擎直写</span>'
                 elif t_docs_count > 0:
-                    mode_badge = f'<span class="ai-mode-pill-rag">📚 RAG 知识库检索 · 引用 {t_docs_count} 篇文档</span>'
+                    mode_badge = f'<span class="ai-mode-pill-rag">📚 RAG 知识库检索 · 引用 {t_docs_count} 篇授权文档</span>'
                 else:
                     mode_badge = '<span class="ai-mode-pill">⚡ DeepSeek 大模型直连</span>'
 
                 mem_badges = []
+                if not is_denied and blocked_cnt > 0 and t_docs_count > 0:
+                    mem_badges.append(
+                        f'<span class="ai-mode-pill-shield">🛡️ 已前置过滤 {blocked_cnt} 篇无权文档</span>'
+                    )
                 if recalled_mems:
                     mem_badges.append(
                         f'<span class="ai-mode-pill-mem-recall">🧠 已调用 {len(recalled_mems)} 条长期记忆</span>'
@@ -797,11 +1047,12 @@ if page == "💬 主对话":
                 # 3. 如果该轮调用了 RAG 知识库，提供可折叠的参考文档卡片（默认收起，不遮挡对话流）
                 turn_docs = extras.get("docs", [])
                 if turn_docs:
-                    with st.expander(f"📄 查看本轮检索到的 {len(turn_docs)} 篇知识库文档", expanded=False):
+                    with st.expander(f"📄 查看本轮检索到的 {len(turn_docs)} 篇已授权知识库文档", expanded=False):
                         for i, doc in enumerate(turn_docs, 1):
+                            sec_lvl = doc.get("security_level", 1)
                             st.markdown(
                                 f"**#{i} [{doc.get('source_type', 'DOC').upper()}] {doc.get('title', '未命名')}** "
-                                f"(`领域: {doc.get('domain', '通用')}` | `责任人: {doc.get('author', '未知')}` | `RRF分: {doc.get('score', 0):.4f}`)"
+                                f"(`密级: L{sec_lvl}` | `领域: {doc.get('domain', '通用')}` | `责任人: {doc.get('author', '未知')}` | `RRF分: {doc.get('score', 0):.4f}`)"
                             )
                             st.caption(doc.get("text", "")[:350] + ("..." if len(doc.get("text", "")) > 350 else ""))
 
@@ -827,7 +1078,7 @@ if page == "💬 主对话":
             </div>
             """, unsafe_allow_html=True)
             with st.spinner("正在思考..."):
-                process_user_message(prompt.strip(), mode_key, top_k, domain_arg, use_ltm=use_ltm, auto_extract_ltm=auto_extract_ltm)
+                process_user_message(prompt.strip(), mode_key, top_k, source_arg, use_ltm=use_ltm, auto_extract_ltm=auto_extract_ltm)
         st.rerun()
 
 
@@ -979,18 +1230,197 @@ elif page == "🧠 记忆管理":
                                 content=edit_content.strip(),
                                 category=edit_cat,
                                 importance=edit_imp,
+                                user_id=CURRENT_USER_ID,
                             )
                             st.rerun()
             with act_c2:
                 if st.button("🗑️ 删除", key=f"del_mem_{mid}", use_container_width=True):
-                    memory_store.delete_memory(mid)
+                    memory_store.delete_memory(mid, user_id=CURRENT_USER_ID)
                     st.rerun()
 
 
 # =====================================================================
-# 页面 3：文档自动化生成
+# 页面 3：管理员专属「权限管理与安全审计后台」
+# =====================================================================
+elif page == "🛡️ 权限与审计":
+    if not current_user.is_admin:
+        st.error("🔒 权限不足：仅系统管理员可访问权限与安全审计后台。")
+        st.stop()
+
+    st.markdown("""
+    <div class="doubao-topbar">
+        <div class="doubao-topbar-title">🛡️ 企业权限管理与安全审计中心</div>
+        <div class="doubao-topbar-sub">基于 MySQL RBAC / ABAC 策略 · 员工账号授权、密级管控与越权拦截全链路审计</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    all_users = auth_manager.list_users()
+    recent_logs_all = auth_manager.list_audit_logs(limit=200)
+    deny_count = sum(1 for x in recent_logs_all if x.get("status") == "DENY")
+    active_users_cnt = sum(1 for u in all_users if u.get("is_active"))
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("员工账号总数", f"{len(all_users)} 人")
+    with k2:
+        st.metric("已启用账号", f"{active_users_cnt} 人")
+    with k3:
+        st.metric("近期审计记录", f"{len(recent_logs_all)} 条")
+    with k4:
+        st.metric("越权/失败拦截 (DENY)", f"{deny_count} 次")
+
+    st.divider()
+    tab_users, tab_audit = st.tabs(["👥 员工账号与权限配置", "📋 安全审计日志"])
+
+    with tab_users:
+        with st.expander("➕ 新增员工账号", expanded=False):
+            with st.form("admin_create_user_form", border=False):
+                c1, c2 = st.columns(2)
+                with c1:
+                    new_u_name = st.text_input("登录账号 (username)", placeholder="例如：ops_chen")
+                    new_u_dept = st.text_input("所属部门", value="基础架构与运维部")
+                    new_u_role = st.selectbox(
+                        "角色",
+                        options=list(ROLE_POLICIES.keys()),
+                        index=1,
+                        format_func=lambda r: f"{ROLE_POLICIES[r]['role_name']} ({r})"
+                    )
+                with c2:
+                    new_u_dname = st.text_input("员工姓名", placeholder="例如：陈工")
+                    new_u_pwd = st.text_input("初始密码（至少6位）", type="password")
+                    new_u_cl = st.slider("数据密级上限", 1, 4, 2)
+                submit_create = st.form_submit_button("创建员工账号", type="primary")
+                if submit_create:
+                    ok, msg = auth_manager.create_user(
+                        username=new_u_name,
+                        display_name=new_u_dname,
+                        password=new_u_pwd,
+                        department=new_u_dept,
+                        role=new_u_role,
+                        clearance_level=new_u_cl,
+                        operator=current_user,
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        st.caption(f"当前共 {len(all_users)} 个企业账号（密码均以 PBKDF2-SHA256 加盐哈希存储）")
+        for u_row in all_users:
+            uid = u_row["user_id"]
+            r_key = u_row["role"]
+            r_policy = ROLE_POLICIES.get(r_key, ROLE_POLICIES["intern"])
+            cl_lvl = int(u_row["clearance_level"])
+            is_act = bool(u_row["is_active"])
+            status_badge = "🟢 正常" if is_act else "🔴 已禁用"
+            last_login = u_row.get("last_login_at")
+            last_login_str = datetime.fromtimestamp(last_login).strftime("%Y-%m-%d %H:%M") if last_login else "从未登录"
+            allowed_srcs_str = "、".join(sorted(r_policy["allowed_sources"]))
+
+            st.markdown(f"""
+            <div class="mem-card">
+                <div class="mem-card-header">
+                    <span><span class="mem-cat-badge">{html.escape(r_policy['role_name'])} · {html.escape(CLEARANCE_LABELS.get(cl_lvl, f'L{cl_lvl}'))}</span> &nbsp; {status_badge}</span>
+                    <span>最近登录：{last_login_str}</span>
+                </div>
+                <div class="mem-card-body">
+                    <b>{html.escape(u_row['display_name'])}</b> (<code>@{html.escape(u_row['username'])}</code>) · {html.escape(u_row['department'])}<br>
+                    <span style="font-size:12px; color:#6b7280;">授权数据源：{html.escape(allowed_srcs_str)}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            with st.expander(f"✏️ 调整 @{u_row['username']} 的角色、密级或启停状态", expanded=False):
+                with st.form(f"edit_user_form_{uid}", border=False):
+                    ec1, ec2, ec3 = st.columns([1.2, 1.0, 0.8])
+                    role_keys = list(ROLE_POLICIES.keys())
+                    r_idx = role_keys.index(r_key) if r_key in role_keys else 0
+                    with ec1:
+                        ed_role = st.selectbox(
+                            "角色",
+                            options=role_keys,
+                            index=r_idx,
+                            format_func=lambda r: f"{ROLE_POLICIES[r]['role_name']} ({r})",
+                            key=f"ed_role_{uid}",
+                        )
+                        ed_dept = st.text_input("部门", value=u_row["department"], key=f"ed_dept_{uid}")
+                    with ec2:
+                        ed_cl = st.slider("密级上限 (L1-L4)", 1, 4, cl_lvl, key=f"ed_cl_{uid}")
+                        ed_pwd = st.text_input("重置密码（留空则不改）", type="password", key=f"ed_pwd_{uid}")
+                    with ec3:
+                        ed_act = st.toggle(
+                            "启用账号",
+                            value=is_act,
+                            disabled=(uid == current_user.user_id),
+                            key=f"ed_act_{uid}",
+                        )
+                    if st.form_submit_button("💾 保存权限变更", type="primary"):
+                        ok, msg = auth_manager.update_user_access(
+                            target_user_id=uid,
+                            role=ed_role,
+                            clearance_level=ed_cl,
+                            department=ed_dept,
+                            is_active=ed_act,
+                            new_password=ed_pwd,
+                            operator=current_user,
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+    with tab_audit:
+        af1, af2, af3 = st.columns([1.4, 1.0, 1.2])
+        with af1:
+            audit_user_kw = st.text_input("按账号搜索", placeholder="输入用户名过滤...", label_visibility="collapsed", key="audit_u_kw")
+        with af2:
+            audit_status_f = st.selectbox("状态", ["ALL", "DENY", "ALLOW"], label_visibility="collapsed", key="audit_st_f")
+        with af3:
+            audit_action_f = st.selectbox(
+                "事件类型",
+                ["ALL", "RAG_DENY", "RAG_QUERY", "RAG_LEVEL3_QUERY", "LOGIN_OK", "LOGIN_FAIL", "DOC_EXPORT", "ADMIN_CREATE_USER", "ADMIN_UPDATE_USER"],
+                label_visibility="collapsed",
+                key="audit_act_f",
+            )
+
+        logs = auth_manager.list_audit_logs(
+            limit=100,
+            username=audit_user_kw,
+            status=audit_status_f,
+            action=audit_action_f,
+        )
+        if not logs:
+            st.info("暂无符合条件的审计日志记录。")
+        else:
+            table_rows = []
+            for lg in logs:
+                ts_s = datetime.fromtimestamp(lg["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                st_tag = "🔴 DENY" if lg["status"] == "DENY" else "🟢 ALLOW"
+                table_rows.append(
+                    {
+                        "时间": ts_s,
+                        "结果": st_tag,
+                        "账号": lg["username"],
+                        "角色": lg["role"],
+                        "事件": lg["action"],
+                        "查询内容": (lg["query_text"] or "")[:45],
+                        "放行文档": lg["allowed_docs_count"],
+                        "拦截文档": lg["blocked_docs_count"],
+                        "详情": (lg["detail"] or "")[:70],
+                    }
+                )
+            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
+# =====================================================================
+# 页面 4：文档自动化生成
 # =====================================================================
 elif page == "📑 文档自动化生成":
+    if not current_user.can_export_doc:
+        st.error("🔒 权限不足：您当前角色无权使用技术文档起草与 Word 导出功能。")
+        st.stop()
     st.markdown("""
     <div class="doubao-topbar">
         <div class="doubao-topbar-title">📑 企业技术文档与可研报告自动化生成</div>
@@ -1019,6 +1449,13 @@ elif page == "📑 文档自动化生成":
 
                 st.session_state["gen_doc_path"] = file_path
                 st.session_state["gen_doc_md"] = md_content
+                auth_manager.log_audit(
+                    user=current_user,
+                    action="DOC_EXPORT",
+                    status="ALLOW",
+                    query_text=doc_title,
+                    detail=f"起草导出文档：{doc_type}",
+                )
                 st.success("🎉 文档起草完成！可在右侧预览或下载 Word 文件。")
 
     with col_preview:

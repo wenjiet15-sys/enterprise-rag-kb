@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # src/rag_pipeline.py
+import re
 import time
 from typing import List, Dict, Any, Optional
 from src.bm25_retriever import BM25Retriever
@@ -8,22 +9,30 @@ from src.hybrid_reranker import HybridReranker
 from src.generator import DeepSeekGenerator, MODEL_TIER_PROFILES
 from src.intent_router import ProgressiveFunnelRouter, SessionState
 from src.memory_manager import LongTermMemoryManager
+from src.access_control import (
+    UserContext,
+    SOURCE_TYPE_LABELS,
+    annotate_corpus_acl,
+    can_access_document,
+    can_access_engineering_ticket,
+)
 
 class EnterpriseRAGPipeline:
     """
     企业级多源知识库检索与生成流水线 (Enterprise RAG Pipeline)
     
-    严格贯彻“算力梯次配置 (Model Cascading)”架构设计：
-    - Level 1: 规则分诊台 (0 大模型算力，<1ms 秒回，0 Token 成本，目标拦截 ~60%)
-    - Level 2: 专科门诊 (轻量化 SLM，结合病史记忆与指代消解，专科事实 RAG，目标承接 ~35%)
-    - Level 3: 联合会诊 (重型推理 LLM deepseek-reasoner，多工具调用链，跨源冲突仲裁，严格压制 <5%)
+    严格贯彻“算力梯次配置 (Model Cascading)”与“检索前强权限过滤 (Pre-Retrieval RBAC/ACL)”：
+    - Level 1: 规则分诊台 (0 大模型算力，<1ms 秒回，0 Token 成本)
+    - Level 2: 专科门诊 (轻量化 SLM，原生多轮 + 长期记忆 + 检索前权限硬过滤 RAG)
+    - Level 3: 联合会诊 (重型推理 LLM deepseek-reasoner，仅授权角色可用，跨源冲突仲裁)
     """
-    def __init__(self, memory_store=None):
+    def __init__(self, memory_store=None, auth_manager=None):
         self.bm25_retriever = BM25Retriever()
         self.vector_retriever = VectorRetriever()
         self.reranker = HybridReranker(self.bm25_retriever, self.vector_retriever)
         self.generator = DeepSeekGenerator()
         self.memory_manager: Optional[LongTermMemoryManager] = None
+        self.auth_manager = auth_manager
         if memory_store is not None:
             self.attach_memory(memory_store)
         self.is_initialized = False
@@ -34,13 +43,17 @@ class EnterpriseRAGPipeline:
         if memory_store is not None:
             self.memory_manager = LongTermMemoryManager(store=memory_store)
 
+    def attach_auth(self, auth_manager) -> None:
+        """挂载 MySQL 认证与安全审计管理器"""
+        self.auth_manager = auth_manager
+
     def initialize(self, meta_file: str = "data_cache/doc_meta.json", emb_file: str = "data_cache/doc_embeddings.npy"):
         if self.is_initialized:
             return
         print("Initializing BM25 and Vector indices...")
         import json
         with open(meta_file, "r", encoding="utf-8") as f:
-            docs = json.load(f)
+            docs = annotate_corpus_acl(json.load(f))
         self.doc_metadata = docs
         self.bm25_retriever.fit(docs)
         self.vector_retriever.load()
@@ -68,18 +81,164 @@ class EnterpriseRAGPipeline:
         doc.setdefault("score", doc.get(score_key, 0.0))
         return doc
 
-    def retrieve(self, query: str, top_k: int = 5, mode: str = "hybrid", domain_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        mode: str = "hybrid",
+        domain_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+        user_ctx: Optional[UserContext] = None,
+    ) -> List[Dict[str, Any]]:
         if not self.is_initialized:
             self.initialize()
+        if user_ctx is not None:
+            if not user_ctx.is_active:
+                return []
+            if source_filter and not user_ctx.is_admin and source_filter.lower().strip() not in user_ctx.allowed_sources:
+                return []
         mode = self.MODE_ALIASES.get((mode or "hybrid").lower(), "hybrid")
         if mode == "bm25":
-            hits = self.bm25_retriever.search(query, top_k=top_k, filter_domain=domain_filter)
+            hits = self.bm25_retriever.search(
+                query,
+                top_k=top_k,
+                filter_domain=domain_filter,
+                filter_source=source_filter,
+                user_ctx=user_ctx,
+            )
             return [self._to_doc(h, "bm25_score") for h in hits]
         if mode == "vector":
-            hits = self.vector_retriever.search(query, top_k=top_k, filter_domain=domain_filter)
+            hits = self.vector_retriever.search(
+                query,
+                top_k=top_k,
+                filter_domain=domain_filter,
+                filter_source=source_filter,
+                user_ctx=user_ctx,
+            )
             return [self._to_doc(h, "vector_score") for h in hits]
-        fused = self.reranker.hybrid_search(query, top_k=top_k, domain_filter=domain_filter)
+        fused = self.reranker.hybrid_search(
+            query,
+            top_k=top_k,
+            domain_filter=domain_filter,
+            source_filter=source_filter,
+            user_ctx=user_ctx,
+        )
         return [self._to_doc(d, "rrf_score") for d in fused]
+
+    @staticmethod
+    def _detect_restricted_target(query: str, user_ctx: Optional[UserContext]) -> Optional[str]:
+        """检测用户是否显式查询了当前角色无权访问的受限数据源或高密级主题"""
+        if user_ctx is None or user_ctx.is_admin:
+            return None
+        ql = (query or "").lower()
+
+        # 1. 研发工单 / 代码仓库 / 缺陷类目标
+        eng_hit = (
+            bool(re.search(r"\b(eng|jira|lin)-\d+\b", ql))
+            or bool(re.search(r"\bpr[\s\-_#]*\d+\b", ql))
+            or any(k in ql for k in ("github", "jira", "linear", "缺陷工单", "代码审查", "pull request", "脑裂"))
+        )
+        if eng_hit and not can_access_engineering_ticket(user_ctx):
+            return "研发工程数据源（Jira / GitHub / Linear）"
+
+        # 1.5 生产基础设施与集群部署规范（需 L2 及以上密级 + 工程/运维权限）
+        infra_hit = any(k in ql for k in ("v2 cluster", "v2-cluster", "us-west", "us-east", "集群部署", "生产集群", "容灾", "failover", "k8s", "kubernetes"))
+        if infra_hit and (user_ctx.clearance_level < 2 or not can_access_engineering_ticket(user_ctx)):
+            return "L2+ 运维与集群部署规范（需研发/运维 L2+ 权限）"
+
+        # 2. 商务 / HubSpot 客户报价与合同
+        sales_hit = any(k in ql for k in ("hubspot", "crm", "客户报价", "商机", "客户合同", "报价单"))
+        if sales_hit and "hubspot" not in user_ctx.allowed_sources:
+            return "商务与客户治理数据源（HubSpot）"
+
+        # 3. 邮件往来 (Gmail)
+        if any(k in ql for k in ("gmail", "往来邮件", "内部邮件")) and "gmail" not in user_ctx.allowed_sources:
+            return "内外通信数据源（Gmail）"
+
+        # 4. 机密会议纪要 / 高密级主题 (L3+)
+        conf_hit = any(k in ql for k in ("fireflies", "高管会议", "董事会", "薪资", "payroll", "salary", "board meeting", "acquisition"))
+        if conf_hit and ("fireflies" not in user_ctx.allowed_sources or user_ctx.clearance_level < 3):
+            return "高密级会议与机密文档（L3+ / Fireflies）"
+
+        return None
+
+    def _build_denied_result(
+        self,
+        query: str,
+        session: SessionState,
+        user_ctx: Optional[UserContext],
+        reason_label: str,
+        start_total: float,
+        blocked_docs_count: int = 0,
+        memory_events: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """构造完全脱敏的越权拦截拒答（不泄露任何无权文档标题或内容），并写入安全审计日志"""
+        role_desc = f"{user_ctx.role_name} · {user_ctx.clearance_label}" if user_ctx else "未认证访客"
+        allowed_src_names = (
+            "、".join(sorted(user_ctx.allowed_sources))
+            if (user_ctx and user_ctx.allowed_sources)
+            else "无"
+        )
+        ans = (
+            f"🔒 **权限不足，已拦截本次知识库访问**\n\n"
+            f"- **拦截原因**：您请求的内容涉及 **{reason_label}**，超出当前账号权限范围。\n"
+            f"- **当前身份**：`{role_desc}`（允许访问数据源：`{allowed_src_names}`）\n"
+            f"- **合规说明**：为防止数据越权泄露，系统已在检索前自动过滤未授权资料，本次请求已记录至企业安全审计日志。如需查阅，请联系系统管理员申请提权。"
+        )
+        _tot = round(time.time() - start_total, 4)
+
+        if self.auth_manager is not None:
+            self.auth_manager.log_audit(
+                user=user_ctx,
+                action="RAG_DENY",
+                status="DENY",
+                query_text=query,
+                allowed_docs_count=0,
+                blocked_docs_count=max(1, int(blocked_docs_count)),
+                detail=f"越权拦截: {reason_label}",
+            )
+
+        session.add_turn(
+            "user", query, level=1, stage="权限拦截拒答",
+            original_query=query, rewritten_query=query,
+            model="RBAC/ACL安全门禁(0大模型算力)", total_time=_tot, docs_count=0
+        )
+        session.add_turn(
+            "assistant", ans, level=1, stage="权限拦截拒答",
+            original_query=query, rewritten_query=query,
+            model="RBAC/ACL安全门禁(0大模型算力)", total_time=_tot, docs_count=0
+        )
+        return {
+            "level": 1,
+            "funnel_res": {
+                "level": 1,
+                "level_name": "安全门禁拦截",
+                "funnel_badge": "🔒 权限不足拦截",
+                "action": "access_denied",
+                "needs_rag": False,
+                "rewritten_query": query,
+                "original_query": query,
+                "history_used": False,
+            },
+            "tier_profile": MODEL_TIER_PROFILES[1],
+            "docs": [],
+            "answer": ans,
+            "reasoning_content": "",
+            "tool_traces": [],
+            "conflict_matrix": [],
+            "retrieve_time": 0.0,
+            "gen_time": _tot,
+            "total_time": _tot,
+            "skipped_retrieval": True,
+            "access_denied": True,
+            "blocked_docs_count": max(1, int(blocked_docs_count)),
+            "history_messages_count": 0,
+            "summary_updated": False,
+            "rolling_summary": session.rolling_summary,
+            "recalled_memories": [],
+            "memory_events": memory_events or [],
+            "session_summary": session.get_summary(),
+        }
 
     def _fallback_general_answer(self, query: str, error_msg: str = "") -> str:
         """当大模型 API 网络连接异常时的错误提示（不再返回硬编码的假模板）"""
@@ -194,19 +353,34 @@ class EnterpriseRAGPipeline:
         top_k: int = 5,
         mode: str = "hybrid",
         domain_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
         user_id: str = "default_user",
+        user_ctx: Optional[UserContext] = None,
         use_long_term_memory: bool = True,
         auto_extract_memory: bool = True,
     ) -> Dict[str, Any]:
         """
-        基于三层渐进式漏斗架构、算力梯次配置与三层记忆系统的端到端问答与状态流转
+        基于三层渐进式漏斗架构、算力梯次配置、三层记忆系统与 RBAC/ACL 安全门禁的端到端问答
         """
         if session is None:
             session = SessionState("default_session")
+        if user_ctx is not None:
+            user_id = user_ctx.user_id
 
         start_total = time.time()
         memory_events: List[Dict[str, Any]] = []
         explicit_mem_consumed = False
+
+        # -1. 账号禁用硬拦截（Fail-Closed）
+        if user_ctx is not None and not user_ctx.is_active:
+            return self._build_denied_result(
+                query=query,
+                session=session,
+                user_ctx=user_ctx,
+                reason_label="当前账号已被禁用",
+                start_total=start_total,
+                blocked_docs_count=0,
+            )
 
         # 0. 显式长期记忆指令优先拦截（记住…… / 忘掉关于……的记忆）
         if self.memory_manager is not None:
@@ -255,6 +429,8 @@ class EnterpriseRAGPipeline:
                         "gen_time": _tot,
                         "total_time": _tot,
                         "skipped_retrieval": True,
+                        "access_denied": False,
+                        "blocked_docs_count": 0,
                         "history_messages_count": 0,
                         "summary_updated": False,
                         "rolling_summary": session.rolling_summary,
@@ -293,6 +469,8 @@ class EnterpriseRAGPipeline:
                 "gen_time": round(gen_time, 4),
                 "total_time": round(time.time() - start_total, 4),
                 "skipped_retrieval": True,
+                "access_denied": False,
+                "blocked_docs_count": 0,
                 "history_messages_count": 0,
                 "summary_updated": False,
                 "rolling_summary": session.rolling_summary,
@@ -302,17 +480,87 @@ class EnterpriseRAGPipeline:
             }
 
         # -------------------------------------------------------------
-        # Level 2: 上下文层 - 专科门诊 (轻量化 SLM，原生多轮上下文 + 长期记忆 + 专科 RAG)
+        # Level 2: 上下文层 - 专科门诊 (轻量化 SLM，原生多轮 + 长期记忆 + 检索前强权限过滤 RAG)
         # -------------------------------------------------------------
         elif level == 2:
             needs_rag = funnel_res.get("needs_rag", True)
             docs = []
             ret_time = 0.0
+            blocked_docs_count = 0
+
+            # 即使路由判定为普通对话，若显式提及受限敏感数据源/工单也进行越权门禁校验
+            if user_ctx is not None and not user_ctx.is_admin:
+                explicit_restricted = self._detect_restricted_target(actual_query, user_ctx)
+                if explicit_restricted:
+                    if not self.is_initialized:
+                        self.initialize()
+                    b_cnt, _, _ = self.bm25_retriever.probe_blocked_scores(actual_query, user_ctx)
+                    return self._build_denied_result(
+                        query=query,
+                        session=session,
+                        user_ctx=user_ctx,
+                        reason_label=explicit_restricted,
+                        start_total=start_total,
+                        blocked_docs_count=b_cnt,
+                        memory_events=memory_events,
+                    )
 
             if needs_rag:
+                # 校验显式数据源过滤是否越权
+                if user_ctx is not None and source_filter and not user_ctx.is_admin:
+                    if source_filter.lower().strip() not in user_ctx.allowed_sources:
+                        src_label = SOURCE_TYPE_LABELS.get(source_filter.lower().strip(), source_filter)
+                        return self._build_denied_result(
+                            query=query,
+                            session=session,
+                            user_ctx=user_ctx,
+                            reason_label=f"受限数据源【{src_label}】",
+                            start_total=start_total,
+                            blocked_docs_count=1,
+                            memory_events=memory_events,
+                        )
+
                 t_ret_start = time.time()
-                docs = self.retrieve(actual_query, top_k=top_k, mode=mode, domain_filter=domain_filter)
+                docs = self.retrieve(
+                    actual_query,
+                    top_k=top_k,
+                    mode=mode,
+                    domain_filter=domain_filter,
+                    source_filter=source_filter,
+                    user_ctx=user_ctx,
+                )
                 ret_time = time.time() - t_ret_start
+
+                # 静默安全探针：检测是否因权限不足导致真实匹配文档全部被屏蔽
+                if user_ctx is not None and not user_ctx.is_admin:
+                    blocked_docs_count, top_blocked_s, top_allowed_s = self.bm25_retriever.probe_blocked_scores(
+                        actual_query, user_ctx
+                    )
+                    if (len(docs) == 0 and blocked_docs_count > 0) or (
+                        blocked_docs_count > 0 and top_blocked_s >= 4.0 and top_allowed_s < 1.5
+                    ) or (
+                        blocked_docs_count > 0 and top_blocked_s >= 6.0 and top_blocked_s > top_allowed_s * 2.2
+                    ):
+                        return self._build_denied_result(
+                            query=query,
+                            session=session,
+                            user_ctx=user_ctx,
+                            reason_label="受限业务域或更高密级内部文档",
+                            start_total=start_total,
+                            blocked_docs_count=blocked_docs_count,
+                            memory_events=memory_events,
+                        )
+
+                if self.auth_manager is not None and user_ctx is not None:
+                    self.auth_manager.log_audit(
+                        user=user_ctx,
+                        action="RAG_QUERY",
+                        status="ALLOW",
+                        query_text=query,
+                        allowed_docs_count=len(docs),
+                        blocked_docs_count=blocked_docs_count,
+                        detail=f"检索放行（模式: {mode}, 召回授权文档: {len(docs)} 篇, 前置过滤拦截: {blocked_docs_count} 篇）",
+                    )
 
             t_gen_start = time.time()
             history_messages = session.get_recent_messages(max_turns=6)
@@ -378,6 +626,8 @@ class EnterpriseRAGPipeline:
                 "gen_time": round(gen_time, 3),
                 "total_time": round(time.time() - start_total, 3),
                 "skipped_retrieval": not needs_rag,
+                "access_denied": False,
+                "blocked_docs_count": blocked_docs_count,
                 "history_messages_count": len(history_messages),
                 "summary_updated": summary_updated,
                 "rolling_summary": session.rolling_summary,
@@ -387,13 +637,76 @@ class EnterpriseRAGPipeline:
             }
 
         # -------------------------------------------------------------
-        # Level 3: 工具兜底层 - 多科室联合会诊 (重型推理 LLM，多工具链，跨源冲突仲裁)
+        # Level 3: 工具兜底层 - 多科室联合会诊 (仅授权角色可调用，检索前强过滤)
         # -------------------------------------------------------------
         else:
+            if user_ctx is not None and not user_ctx.can_use_level3:
+                return self._build_denied_result(
+                    query=query,
+                    session=session,
+                    user_ctx=user_ctx,
+                    reason_label="Level 3 多科室联合会诊与跨源决策能力",
+                    start_total=start_total,
+                    blocked_docs_count=1,
+                    memory_events=memory_events,
+                )
+
+            if user_ctx is not None and not user_ctx.is_admin:
+                explicit_restricted = self._detect_restricted_target(actual_query, user_ctx)
+                if explicit_restricted:
+                    if not self.is_initialized:
+                        self.initialize()
+                    b_cnt, _, _ = self.bm25_retriever.probe_blocked_scores(actual_query, user_ctx)
+                    return self._build_denied_result(
+                        query=query,
+                        session=session,
+                        user_ctx=user_ctx,
+                        reason_label=explicit_restricted,
+                        start_total=start_total,
+                        blocked_docs_count=b_cnt,
+                        memory_events=memory_events,
+                    )
+
             t_ret_start = time.time()
-            # 会诊需要更加广泛的多源事实支撑 (top_k >= 6)
-            docs = self.retrieve(actual_query, top_k=max(top_k, 6), mode=mode, domain_filter=domain_filter)
+            # 会诊需要更加广泛的多源事实支撑 (top_k >= 6)，依然严格受 user_ctx 检索前过滤约束
+            docs = self.retrieve(
+                actual_query,
+                top_k=max(top_k, 6),
+                mode=mode,
+                domain_filter=domain_filter,
+                source_filter=source_filter,
+                user_ctx=user_ctx,
+            )
             ret_time = time.time() - t_ret_start
+
+            blocked_docs_count = 0
+            if user_ctx is not None and not user_ctx.is_admin:
+                blocked_docs_count, top_blocked_s, top_allowed_s = self.bm25_retriever.probe_blocked_scores(
+                    actual_query, user_ctx
+                )
+                if (len(docs) == 0 and blocked_docs_count > 0) or (
+                    blocked_docs_count > 0 and top_blocked_s >= 5.0 and top_allowed_s < 1.5
+                ):
+                    return self._build_denied_result(
+                        query=query,
+                        session=session,
+                        user_ctx=user_ctx,
+                        reason_label="跨源高密级会诊证据文档",
+                        start_total=start_total,
+                        blocked_docs_count=blocked_docs_count,
+                        memory_events=memory_events,
+                    )
+
+            if self.auth_manager is not None and user_ctx is not None:
+                self.auth_manager.log_audit(
+                    user=user_ctx,
+                    action="RAG_LEVEL3_QUERY",
+                    status="ALLOW",
+                    query_text=query,
+                    allowed_docs_count=len(docs),
+                    blocked_docs_count=blocked_docs_count,
+                    detail=f"Level 3 会诊放行（召回授权文档: {len(docs)} 篇, 前置拦截: {blocked_docs_count} 篇）",
+                )
 
             t_gen_start = time.time()
             history_messages = session.get_recent_messages(max_turns=6)
@@ -457,6 +770,8 @@ class EnterpriseRAGPipeline:
                 "gen_time": round(gen_time, 3),
                 "total_time": round(time.time() - start_total, 3),
                 "skipped_retrieval": False,
+                "access_denied": False,
+                "blocked_docs_count": blocked_docs_count,
                 "history_messages_count": len(history_messages),
                 "summary_updated": summary_updated,
                 "rolling_summary": session.rolling_summary,
