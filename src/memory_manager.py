@@ -238,7 +238,7 @@ class LongTermMemoryManager:
         scored.sort(key=lambda x: x[0], reverse=True)
         deleted = []
         for _, mem in scored[:5]:
-            if self.store.delete_memory(mem["id"]):
+            if self.store.delete_memory(mem["id"], user_id=user_id):
                 deleted.append(mem)
         return deleted
 
@@ -295,6 +295,7 @@ class LongTermMemoryManager:
                     category=category,
                     keywords=_extract_keywords(content),
                     importance=importance,
+                    user_id=user_id,
                 )
                 if ok:
                     events.append(
@@ -406,7 +407,11 @@ class LongTermMemoryManager:
         if best_mem is not None and best_sim >= 0.62:
             if best_mem["content"].strip() == clean:
                 # 完全一致时仅刷新重要度/时间，不重复播报新增
-                self.store.update_memory(best_mem["id"], importance=max(best_mem.get("importance", 3), importance))
+                self.store.update_memory(
+                    best_mem["id"],
+                    importance=max(best_mem.get("importance", 3), importance),
+                    user_id=user_id,
+                )
                 return {
                     "action": "updated",
                     "id": best_mem["id"],
@@ -419,6 +424,7 @@ class LongTermMemoryManager:
                 category=category,
                 keywords=kw,
                 importance=max(best_mem.get("importance", 3), importance),
+                user_id=user_id,
             )
             return {
                 "action": "updated",
@@ -503,7 +509,7 @@ class LongTermMemoryManager:
         selected = [item[1] for item in scored_items[:top_k]]
 
         if selected:
-            self.store.touch_memories([m["id"] for m in selected])
+            self.store.touch_memories([m["id"] for m in selected], user_id=user_id)
         return selected
 
     @staticmethod

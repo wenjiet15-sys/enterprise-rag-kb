@@ -52,6 +52,11 @@ def _trim_turn_extras(turn_extra: Optional[Dict[str, Any]], max_doc_chars: int =
                     "title": d.get("title", "未命名"),
                     "domain": d.get("domain", "通用"),
                     "author": d.get("author", "未知"),
+                    "security_level": d.get("security_level", 1),
+                    "section_path": d.get("section_path", ""),
+                    "context_window_range": d.get("context_window_range", ""),
+                    "chunk_index": d.get("chunk_index"),
+                    "total_chunks": d.get("total_chunks"),
                     "score": d.get("score", d.get("rrf_score", 0.0)),
                     "text": doc_text,
                 }
@@ -234,6 +239,14 @@ class MemoryStore:
         )
 
         with self.engine.begin() as conn:
+            # 防水平越权：若该 session_id 已存在且归属其他用户，拒绝覆盖写入
+            owner_row = conn.execute(
+                text("SELECT user_id FROM sessions WHERE session_id = :sid;"),
+                {"sid": session.session_id},
+            ).scalar()
+            if owner_row is not None and owner_row != user_id:
+                raise PermissionError(f"无权修改属于其他用户的会话: {session.session_id}")
+
             conn.execute(
                 text(
                     """
@@ -349,13 +362,23 @@ class MemoryStore:
                     rows_to_insert,
                 )
 
-    def load_session(self, session_id: str) -> Optional[Tuple[SessionState, Dict[int, Dict[str, Any]]]]:
-        """按 session_id 加载完整 SessionState 与每轮 turn_extras"""
+    def load_session(
+        self,
+        session_id: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[Tuple[SessionState, Dict[int, Dict[str, Any]]]]:
+        """按 session_id 加载完整 SessionState 与每轮 turn_extras（传入 user_id 时强制校验归属，防水平越权）"""
         with self.engine.connect() as conn:
-            s_row = conn.execute(
-                text("SELECT * FROM sessions WHERE session_id = :sid;"),
-                {"sid": session_id},
-            ).mappings().first()
+            if user_id is not None:
+                s_row = conn.execute(
+                    text("SELECT * FROM sessions WHERE session_id = :sid AND user_id = :uid;"),
+                    {"sid": session_id, "uid": user_id},
+                ).mappings().first()
+            else:
+                s_row = conn.execute(
+                    text("SELECT * FROM sessions WHERE session_id = :sid;"),
+                    {"sid": session_id},
+                ).mappings().first()
             if not s_row:
                 return None
 
@@ -492,20 +515,34 @@ class MemoryStore:
             )
         return results
 
-    def rename_session(self, session_id: str, new_title: str) -> None:
+    def rename_session(self, session_id: str, new_title: str, user_id: Optional[str] = None) -> bool:
         clean_title = (new_title or "").strip()[:120] or "未命名对话"
         with self.engine.begin() as conn:
-            conn.execute(
-                text("UPDATE sessions SET title = :title, last_updated = :ts WHERE session_id = :sid;"),
-                {"title": clean_title, "ts": time.time(), "sid": session_id},
-            )
+            if user_id is not None:
+                res = conn.execute(
+                    text("UPDATE sessions SET title = :title, last_updated = :ts WHERE session_id = :sid AND user_id = :uid;"),
+                    {"title": clean_title, "ts": time.time(), "sid": session_id, "uid": user_id},
+                )
+            else:
+                res = conn.execute(
+                    text("UPDATE sessions SET title = :title, last_updated = :ts WHERE session_id = :sid;"),
+                    {"title": clean_title, "ts": time.time(), "sid": session_id},
+                )
+            return res.rowcount > 0
 
-    def delete_session(self, session_id: str) -> None:
+    def delete_session(self, session_id: str, user_id: Optional[str] = None) -> bool:
         with self.engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM sessions WHERE session_id = :sid;"),
-                {"sid": session_id},
-            )
+            if user_id is not None:
+                res = conn.execute(
+                    text("DELETE FROM sessions WHERE session_id = :sid AND user_id = :uid;"),
+                    {"sid": session_id, "uid": user_id},
+                )
+            else:
+                res = conn.execute(
+                    text("DELETE FROM sessions WHERE session_id = :sid;"),
+                    {"sid": session_id},
+                )
+            return res.rowcount > 0
 
     # =================================================================
     # 跨会话长期记忆 CRUD（供步骤 3 长期记忆引擎与步骤 4 管理面板调用）
@@ -557,6 +594,7 @@ class MemoryStore:
         category: Optional[str] = None,
         keywords: Optional[str] = None,
         importance: Optional[int] = None,
+        user_id: Optional[str] = None,
     ) -> bool:
         fields = []
         params: Dict[str, Any] = {"mid": int(memory_id), "ts": time.time()}
@@ -576,19 +614,30 @@ class MemoryStore:
             return False
 
         fields.append("updated_at = :ts")
+        where_clause = "id = :mid"
+        if user_id is not None:
+            where_clause += " AND user_id = :uid"
+            params["uid"] = user_id
+
         with self.engine.begin() as conn:
             res = conn.execute(
-                text(f"UPDATE long_term_memories SET {', '.join(fields)} WHERE id = :mid;"),
+                text(f"UPDATE long_term_memories SET {', '.join(fields)} WHERE {where_clause};"),
                 params,
             )
             return res.rowcount > 0
 
-    def delete_memory(self, memory_id: int) -> bool:
+    def delete_memory(self, memory_id: int, user_id: Optional[str] = None) -> bool:
         with self.engine.begin() as conn:
-            res = conn.execute(
-                text("DELETE FROM long_term_memories WHERE id = :mid;"),
-                {"mid": int(memory_id)},
-            )
+            if user_id is not None:
+                res = conn.execute(
+                    text("DELETE FROM long_term_memories WHERE id = :mid AND user_id = :uid;"),
+                    {"mid": int(memory_id), "uid": user_id},
+                )
+            else:
+                res = conn.execute(
+                    text("DELETE FROM long_term_memories WHERE id = :mid;"),
+                    {"mid": int(memory_id)},
+                )
             return res.rowcount > 0
 
     def clear_memories(self, category: Optional[str] = None, user_id: str = "default_user") -> int:
@@ -638,16 +687,26 @@ class MemoryStore:
                 ).mappings().all()
         return [dict(r) for r in rows]
 
-    def touch_memories(self, memory_ids: List[int]) -> None:
+    def touch_memories(self, memory_ids: List[int], user_id: Optional[str] = None) -> None:
         if not memory_ids:
             return
         now = time.time()
         with self.engine.begin() as conn:
-            conn.execute(
-                text(
-                    "UPDATE long_term_memories "
-                    "SET hit_count = hit_count + 1, last_accessed_at = :now "
-                    "WHERE id = :mid;"
-                ),
-                [{"now": now, "mid": int(mid)} for mid in memory_ids],
-            )
+            if user_id is not None:
+                conn.execute(
+                    text(
+                        "UPDATE long_term_memories "
+                        "SET hit_count = hit_count + 1, last_accessed_at = :now "
+                        "WHERE id = :mid AND user_id = :uid;"
+                    ),
+                    [{"now": now, "mid": int(mid), "uid": user_id} for mid in memory_ids],
+                )
+            else:
+                conn.execute(
+                    text(
+                        "UPDATE long_term_memories "
+                        "SET hit_count = hit_count + 1, last_accessed_at = :now "
+                        "WHERE id = :mid;"
+                    ),
+                    [{"now": now, "mid": int(mid)} for mid in memory_ids],
+                )
