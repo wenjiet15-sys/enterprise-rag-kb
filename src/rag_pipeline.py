@@ -37,6 +37,7 @@ class EnterpriseRAGPipeline:
             self.attach_memory(memory_store)
         self.is_initialized = False
         self.doc_metadata = []
+        self.parent_chunks_map: Dict[str, List[Dict[str, Any]]] = {}
 
     def attach_memory(self, memory_store) -> None:
         """挂载 MySQL 记忆存储层并启用跨会话长期记忆引擎"""
@@ -47,18 +48,150 @@ class EnterpriseRAGPipeline:
         """挂载 MySQL 认证与安全审计管理器"""
         self.auth_manager = auth_manager
 
-    def initialize(self, meta_file: str = "data_cache/doc_meta.json", emb_file: str = "data_cache/doc_embeddings.npy"):
+    def _rebuild_parent_chunks_map(self, chunks: List[Dict[str, Any]]) -> None:
+        pmap: Dict[str, List[Dict[str, Any]]] = {}
+        for ch in chunks:
+            pid = ch.get("parent_doc_id") or ch.get("uuid")
+            pmap.setdefault(pid, []).append(ch)
+        for pid, arr in pmap.items():
+            arr.sort(key=lambda x: int(x.get("chunk_index", 0) or 0))
+        self.parent_chunks_map = pmap
+
+    def initialize(
+        self,
+        meta_file: str = "data_cache/chunks_meta.json",
+        fallback_meta_file: str = "data_cache/doc_meta.json",
+    ):
         if self.is_initialized:
             return
-        print("Initializing BM25 and Vector indices...")
+        import os
         import json
-        with open(meta_file, "r", encoding="utf-8") as f:
+        target_meta = meta_file if os.path.exists(meta_file) else fallback_meta_file
+        print(f"Initializing Chunk-Level BM25 and Vector indices from {target_meta}...")
+        with open(target_meta, "r", encoding="utf-8") as f:
             docs = annotate_corpus_acl(json.load(f))
         self.doc_metadata = docs
-        self.bm25_retriever.fit(docs)
+        self._rebuild_parent_chunks_map(docs)
+        self.bm25_retriever.fit(docs, text_key="enriched_text")
         self.vector_retriever.load()
         self.is_initialized = True
-        print(f"Enterprise RAG Pipeline Ready! Total loaded docs: {len(docs)}")
+        print(
+            f"Enterprise RAG Pipeline Ready! Total chunks: {len(docs)} "
+            f"(from {len(self.parent_chunks_map)} parent docs)"
+        )
+
+    def add_chunks_to_index(self, new_chunks: List[Dict[str, Any]]) -> int:
+        """运行时热增量追加新切片（供在线上传文档秒级入库调用）"""
+        if not self.is_initialized:
+            self.initialize()
+        if not new_chunks:
+            return 0
+        annotated = annotate_corpus_acl(new_chunks)
+        self.doc_metadata.extend(annotated)
+        for ch in annotated:
+            pid = ch.get("parent_doc_id") or ch.get("uuid")
+            arr = self.parent_chunks_map.setdefault(pid, [])
+            arr.append(ch)
+            arr.sort(key=lambda x: int(x.get("chunk_index", 0) or 0))
+        self.bm25_retriever.add_docs(annotated)
+        self.vector_retriever.add_docs(annotated)
+        return len(annotated)
+
+    def remove_doc_from_index(self, parent_doc_id: str) -> int:
+        """按父文档 ID 热移除全部关联切片"""
+        if not self.is_initialized or not parent_doc_id:
+            return 0
+        self.doc_metadata = [
+            d for d in self.doc_metadata
+            if (d.get("parent_doc_id") or d.get("uuid")) != parent_doc_id
+        ]
+        self.parent_chunks_map.pop(parent_doc_id, None)
+        removed = self.bm25_retriever.remove_by_parent_id(parent_doc_id)
+        self.vector_retriever.remove_by_parent_id(parent_doc_id)
+        return removed
+
+    def update_doc_acl_in_index(
+        self,
+        parent_doc_id: str,
+        security_level: int,
+        source_type: Optional[str] = None,
+    ) -> int:
+        """运行时热更新单篇文档及其全部切片的密级与数据源归属"""
+        if not self.is_initialized or not parent_doc_id:
+            return 0
+        for d in self.doc_metadata:
+            if (d.get("parent_doc_id") or d.get("uuid")) == parent_doc_id:
+                d["security_level"] = int(security_level)
+                if source_type:
+                    d["source_type"] = source_type.lower().strip()
+        for d in self.parent_chunks_map.get(parent_doc_id, []):
+            d["security_level"] = int(security_level)
+            if source_type:
+                d["source_type"] = source_type.lower().strip()
+        self.bm25_retriever.update_acl_by_parent_id(parent_doc_id, security_level, source_type)
+        return self.vector_retriever.update_acl_by_parent_id(parent_doc_id, security_level, source_type)
+
+    def _expand_small_to_big(
+        self,
+        docs: List[Dict[str, Any]],
+        user_ctx: Optional[UserContext] = None,
+        max_chars: int = 1800,
+    ) -> List[Dict[str, Any]]:
+        """
+        Small-to-Big 父子文档上下文扩展：
+        用精细小块精准命中，送入 LLM 前自动拼接前后相邻块（chunk_index - 1 / + 1），
+        在保证权限一致的前提下为大模型提供完整连续的章节上下文。
+        """
+        expanded_docs: List[Dict[str, Any]] = []
+        for d in docs:
+            item = dict(d)
+            pid = item.get("parent_doc_id") or item.get("uuid")
+            siblings = self.parent_chunks_map.get(pid)
+            c_idx = item.get("chunk_index")
+
+            if not siblings or c_idx is None or len(siblings) <= 1:
+                item["expanded_text"] = item.get("text", "")[:max_chars]
+                item.setdefault("context_window_range", "全文")
+                expanded_docs.append(item)
+                continue
+
+            c_idx = int(c_idx)
+            center_text = (item.get("text") or "").strip()
+            parts: List[str] = []
+            start_i = c_idx
+            end_i = c_idx
+
+            # 前一块（若存在且已授权）
+            if c_idx > 0:
+                prev_ch = siblings[c_idx - 1]
+                if user_ctx is None or can_access_document(user_ctx, prev_ch):
+                    prev_text = (prev_ch.get("text") or "").strip()
+                    budget_prev = max(250, (max_chars - len(center_text)) // 2)
+                    if prev_text:
+                        parts.append(prev_text[-budget_prev:])
+                        start_i = c_idx - 1
+
+            parts.append(center_text)
+
+            # 后一块（若存在且已授权）
+            if c_idx + 1 < len(siblings):
+                next_ch = siblings[c_idx + 1]
+                if user_ctx is None or can_access_document(user_ctx, next_ch):
+                    next_text = (next_ch.get("text") or "").strip()
+                    used = sum(len(p) for p in parts)
+                    budget_next = max(250, max_chars - used)
+                    if next_text:
+                        parts.append(next_text[:budget_next])
+                        end_i = c_idx + 1
+
+            total_ch = int(item.get("total_chunks") or len(siblings))
+            item["expanded_text"] = "\n\n".join(parts)[:max_chars]
+            if start_i == end_i:
+                item["context_window_range"] = f"第 {c_idx + 1}/{total_ch} 段"
+            else:
+                item["context_window_range"] = f"第 {start_i + 1}-{end_i + 1}/{total_ch} 段（命中第 {c_idx + 1} 段）"
+            expanded_docs.append(item)
+        return expanded_docs
 
     MODE_ALIASES = {
         "advanced": "hybrid",
@@ -89,6 +222,7 @@ class EnterpriseRAGPipeline:
         domain_filter: Optional[str] = None,
         source_filter: Optional[str] = None,
         user_ctx: Optional[UserContext] = None,
+        expand_context: bool = True,
     ) -> List[Dict[str, Any]]:
         if not self.is_initialized:
             self.initialize()
@@ -106,8 +240,8 @@ class EnterpriseRAGPipeline:
                 filter_source=source_filter,
                 user_ctx=user_ctx,
             )
-            return [self._to_doc(h, "bm25_score") for h in hits]
-        if mode == "vector":
+            docs = [self._to_doc(h, "bm25_score") for h in hits]
+        elif mode == "vector":
             hits = self.vector_retriever.search(
                 query,
                 top_k=top_k,
@@ -115,15 +249,20 @@ class EnterpriseRAGPipeline:
                 filter_source=source_filter,
                 user_ctx=user_ctx,
             )
-            return [self._to_doc(h, "vector_score") for h in hits]
-        fused = self.reranker.hybrid_search(
-            query,
-            top_k=top_k,
-            domain_filter=domain_filter,
-            source_filter=source_filter,
-            user_ctx=user_ctx,
-        )
-        return [self._to_doc(d, "rrf_score") for d in fused]
+            docs = [self._to_doc(h, "vector_score") for h in hits]
+        else:
+            fused = self.reranker.hybrid_search(
+                query,
+                top_k=top_k,
+                domain_filter=domain_filter,
+                source_filter=source_filter,
+                user_ctx=user_ctx,
+            )
+            docs = [self._to_doc(d, "rrf_score") for d in fused]
+
+        if expand_context:
+            return self._expand_small_to_big(docs, user_ctx=user_ctx)
+        return docs
 
     @staticmethod
     def _detect_restricted_target(query: str, user_ctx: Optional[UserContext]) -> Optional[str]:

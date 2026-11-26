@@ -53,6 +53,10 @@ def _trim_turn_extras(turn_extra: Optional[Dict[str, Any]], max_doc_chars: int =
                     "domain": d.get("domain", "通用"),
                     "author": d.get("author", "未知"),
                     "security_level": d.get("security_level", 1),
+                    "section_path": d.get("section_path", ""),
+                    "context_window_range": d.get("context_window_range", ""),
+                    "chunk_index": d.get("chunk_index"),
+                    "total_chunks": d.get("total_chunks"),
                     "score": d.get("score", d.get("rrf_score", 0.0)),
                     "text": doc_text,
                 }

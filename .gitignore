@@ -22,12 +22,15 @@ write_app.py
 # External benchmark repo (contains nested .git and >10MB index)
 EnterpriseRAG-Bench/
 
-# Generated runtime artifacts & local SQLite cache
+# Generated runtime artifacts & local derived caches
 generated_docs/*.docx
 data_cache/*.docx
 data_cache/*.db
 data_cache/*.db-wal
 data_cache/*.db-shm
+data_cache/chunks_meta.json
+data_cache/chunk_embeddings.npy
+data_cache/chunk_lsa_model.pkl
 
 # OS / Editor files
 .DS_Store

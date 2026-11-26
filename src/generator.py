@@ -135,8 +135,13 @@ class LightweightSLMGenerator:
                 src = doc.get("source_type", "source")
                 title = doc.get("title", "Untitled")
                 author = doc.get("author", "Staff")
-                text = doc.get("text", "")[:1200]
-                header = f"--- [参考资料 {idx+1}]: {src.upper()} | 标题: {title} | 责任人/作者: {author} ---"
+                sec_path = doc.get("section_path") or ""
+                win_range = doc.get("context_window_range") or ""
+                loc_info = f" | 章节: {sec_path}" if sec_path else ""
+                if win_range:
+                    loc_info += f" ({win_range})"
+                text = (doc.get("expanded_text") or doc.get("text", ""))[:1900]
+                header = f"--- [参考资料 {idx+1}]: {src.upper()} | 标题: {title}{loc_info} | 责任人/作者: {author} ---"
                 context_blocks.append(header + "\n" + text)
 
             context_str = "\n\n".join(context_blocks)
@@ -297,8 +302,13 @@ class HeavyReasoningLLMGenerator:
             src = doc.get("source_type", "source")
             title = doc.get("title", "Untitled")
             author = doc.get("author", "Staff")
-            text = doc.get("text", "")[:1500]
-            header = f"--- [跨源证据链 {idx+1}]: {src.upper()} | 标题: {title} | 责任人: {author} ---"
+            sec_path = doc.get("section_path") or ""
+            win_range = doc.get("context_window_range") or ""
+            loc_info = f" | 章节: {sec_path}" if sec_path else ""
+            if win_range:
+                loc_info += f" ({win_range})"
+            text = (doc.get("expanded_text") or doc.get("text", ""))[:2200]
+            header = f"--- [跨源证据链 {idx+1}]: {src.upper()} | 标题: {title}{loc_info} | 责任人: {author} ---"
             context_blocks.append(header + "\n" + text)
 
         context_str = "\n\n".join(context_blocks)

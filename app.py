@@ -16,6 +16,7 @@ from src.intent_router import SessionState
 from src.memory_store import MemoryStore
 from src.memory_manager import MEMORY_CATEGORY_LABELS
 from src.auth_manager import AuthManager
+from src.doc_ingestor import DocumentIngestor
 from src.access_control import (
     UserContext,
     ROLE_POLICIES,
@@ -577,13 +578,29 @@ def load_auth_manager(_engine):
     return AuthManager(_engine)
 
 
+@st.cache_resource
+def load_doc_ingestor(_engine):
+    return DocumentIngestor(_engine)
+
+
 pipeline = load_pipeline()
 pipeline.generator = _gen_mod.DeepSeekGenerator()
 doc_gen = load_doc_generator()
 memory_store = load_memory_store()
 auth_manager = load_auth_manager(memory_store.engine)
+doc_ingestor = load_doc_ingestor(memory_store.engine)
 pipeline.attach_memory(memory_store)
 pipeline.attach_auth(auth_manager)
+
+# 启动首次加载：将 MySQL 中所有历史上传文档切片热同步回内存双路索引
+if not getattr(pipeline, "_uploaded_chunks_synced", False):
+    try:
+        persisted_chunks = doc_ingestor.load_all_uploaded_chunks()
+        if persisted_chunks:
+            pipeline.add_chunks_to_index(persisted_chunks)
+    except Exception:
+        pass
+    pipeline._uploaded_chunks_synced = True
 
 
 def _logout_current_user():
@@ -1044,17 +1061,25 @@ if page == "💬 主对话":
                                     c_label = MEMORY_CATEGORY_LABELS.get(ev.get("category", "custom"), "记忆")
                                     st.markdown(f"- `{act_cn}` `[{c_label}]` {ev.get('content', '')}")
 
-                # 3. 如果该轮调用了 RAG 知识库，提供可折叠的参考文档卡片（默认收起，不遮挡对话流）
+                # 3. 如果该轮调用了 RAG 知识库，提供可折叠的参考文档卡片（精确展示章节路径与命中段落）
                 turn_docs = extras.get("docs", [])
                 if turn_docs:
-                    with st.expander(f"📄 查看本轮检索到的 {len(turn_docs)} 篇已授权知识库文档", expanded=False):
+                    with st.expander(f"📄 查看本轮检索到的 {len(turn_docs)} 个已授权知识片段", expanded=False):
                         for i, doc in enumerate(turn_docs, 1):
                             sec_lvl = doc.get("security_level", 1)
+                            sec_path = doc.get("section_path") or ""
+                            win_range = doc.get("context_window_range") or ""
+                            loc_parts = []
+                            if sec_path:
+                                loc_parts.append(f"`章节: {sec_path}`")
+                            if win_range:
+                                loc_parts.append(f"`定位: {win_range}`")
+                            loc_str = (" | " + " | ".join(loc_parts)) if loc_parts else ""
                             st.markdown(
                                 f"**#{i} [{doc.get('source_type', 'DOC').upper()}] {doc.get('title', '未命名')}** "
-                                f"(`密级: L{sec_lvl}` | `领域: {doc.get('domain', '通用')}` | `责任人: {doc.get('author', '未知')}` | `RRF分: {doc.get('score', 0):.4f}`)"
+                                f"(`密级: L{sec_lvl}`{loc_str} | `RRF分: {doc.get('score', 0):.4f}`)"
                             )
-                            st.caption(doc.get("text", "")[:350] + ("..." if len(doc.get("text", "")) > 350 else ""))
+                            st.caption(doc.get("text", "")[:380] + ("..." if len(doc.get("text", "")) > 380 else ""))
 
                 # 4. 如果触发了 Level 3 深度思考/跨源仲裁，同样提供可折叠查看
                 reasoning_cot = extras.get("reasoning_content", "")
@@ -1270,7 +1295,7 @@ elif page == "🛡️ 权限与审计":
         st.metric("越权/失败拦截 (DENY)", f"{deny_count} 次")
 
     st.divider()
-    tab_users, tab_audit = st.tabs(["👥 员工账号与权限配置", "📋 安全审计日志"])
+    tab_users, tab_ingest, tab_audit = st.tabs(["👥 员工账号与权限配置", "📤 知识入库与切片管理", "📋 安全审计日志"])
 
     with tab_users:
         with st.expander("➕ 新增员工账号", expanded=False):
@@ -1371,6 +1396,126 @@ elif page == "🛡️ 权限与审计":
                         else:
                             st.error(msg)
 
+    with tab_ingest:
+        st.caption(
+            f"当前实时检索索引：共 **{len(pipeline.doc_metadata):,}** 个切片（来自 **{len(pipeline.parent_chunks_map):,}** 篇文档） · "
+            "支持上传 PDF / Word (.docx) / Markdown / TXT，切片后实时热更新索引，无需重启服务。"
+        )
+        with st.container(border=True):
+            st.markdown("**📤 上传新文档并热更新知识库**")
+            up_file = st.file_uploader(
+                "选择文件（支持 .pdf / .docx / .md / .txt）",
+                type=["pdf", "docx", "md", "txt"],
+                key="admin_doc_uploader",
+            )
+            uc1, uc2, uc3 = st.columns([1.4, 1.2, 0.9])
+            default_title = os.path.splitext(up_file.name)[0] if up_file else ""
+            with uc1:
+                up_title = st.text_input("文档标题（默认取文件名）", value=default_title, key="up_doc_title")
+            with uc2:
+                src_keys = sorted(SOURCE_TYPE_LABELS.keys())
+                up_source = st.selectbox(
+                    "归属数据源（决定哪些角色可检索）",
+                    options=src_keys,
+                    index=src_keys.index("confluence"),
+                    format_func=lambda s: SOURCE_TYPE_LABELS.get(s, s),
+                    key="up_doc_src",
+                )
+            with uc3:
+                up_level = st.slider("文档密级 (L1-L4)", 1, 4, 2, key="up_doc_lvl")
+
+            if st.button("🚀 智能切片并实时热入库", type="primary", use_container_width=True, key="btn_ingest_doc"):
+                if up_file is None:
+                    st.warning("请先选择要上传的文件。")
+                else:
+                    with st.spinner("正在解析文件、执行结构感知切片并热更新双路索引..."):
+                        ok, msg, info = doc_ingestor.ingest_uploaded_file(
+                            file_name=up_file.name,
+                            file_bytes=up_file.getvalue(),
+                            title=up_title,
+                            source_type=up_source,
+                            security_level=up_level,
+                            uploader=current_user,
+                            pipeline=pipeline,
+                            auth_manager=auth_manager,
+                        )
+                    if ok:
+                        st.success(msg)
+                        st.session_state["last_ingest_preview"] = info
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        if "last_ingest_preview" in st.session_state:
+            pv = st.session_state["last_ingest_preview"]
+            with st.expander(f"🔎 查看最近入库《{pv.get('title', '')}》切片预览（共 {pv.get('chunk_count', 0)} 块）", expanded=True):
+                for ch in pv.get("chunks_preview", []):
+                    st.markdown(f"**片段 #{ch['chunk_index'] + 1}/{ch['total_chunks']}** · `章节: {ch['section_path']}` · `密级: L{ch['security_level']}`")
+                    st.caption(ch.get("text", "")[:320] + ("..." if len(ch.get("text", "")) > 320 else ""))
+
+        st.divider()
+        uploaded_docs = doc_ingestor.list_uploaded_documents()
+        st.caption(f"已在线上传并持久化的文档 ({len(uploaded_docs)} 篇 · 存 MySQL)")
+        if not uploaded_docs:
+            st.info("暂无在线上传的自定义文档，可在上方上传 PDF / Word / Markdown / TXT 立即体验热入库与权限隔离。")
+        else:
+            src_keys_all = sorted(SOURCE_TYPE_LABELS.keys())
+            for ud in uploaded_docs:
+                did = ud["doc_id"]
+                u_ts = datetime.fromtimestamp(ud["created_at"]).strftime("%Y-%m-%d %H:%M")
+                st.markdown(f"""
+                <div class="mem-card">
+                    <div class="mem-card-header">
+                        <span><span class="mem-cat-badge">{html.escape(ud['source_type'].upper())} · L{int(ud['security_level'])}</span> &nbsp; .{html.escape(ud['file_ext'])} · {int(ud['chunk_count'])} 切片 · {int(ud['char_count'])} 字</span>
+                        <span>上传人：{html.escape(ud['uploader_name'])} · {u_ts}</span>
+                    </div>
+                    <div class="mem-card-body"><b>{html.escape(ud['title'])}</b> <span style="font-size:12px; color:#6b7280;">({html.escape(ud['file_name'])})</span></div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                dc1, dc2 = st.columns([0.84, 0.16])
+                with dc1:
+                    with st.expander("✏️ 调整该文档的数据源或密级（即时生效）", expanded=False):
+                        with st.form(f"edit_udoc_{did}", border=False):
+                            ec1, ec2 = st.columns([1.3, 1.0])
+                            s_idx = src_keys_all.index(ud["source_type"]) if ud["source_type"] in src_keys_all else 0
+                            with ec1:
+                                new_src = st.selectbox(
+                                    "归属数据源",
+                                    options=src_keys_all,
+                                    index=s_idx,
+                                    format_func=lambda s: SOURCE_TYPE_LABELS.get(s, s),
+                                    key=f"ud_src_{did}",
+                                )
+                            with ec2:
+                                new_cl = st.slider("文档密级", 1, 4, int(ud["security_level"]), key=f"ud_cl_{did}")
+                            if st.form_submit_button("💾 保存并热更新索引", type="primary"):
+                                ok, msg = doc_ingestor.update_document_acl(
+                                    doc_id=did,
+                                    security_level=new_cl,
+                                    source_type=new_src,
+                                    pipeline=pipeline,
+                                    operator=current_user,
+                                    auth_manager=auth_manager,
+                                )
+                                if ok:
+                                    st.success(msg)
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                with dc2:
+                    if st.button("🗑️ 删除", key=f"del_udoc_{did}", use_container_width=True):
+                        ok, msg = doc_ingestor.delete_document(
+                            doc_id=did,
+                            pipeline=pipeline,
+                            operator=current_user,
+                            auth_manager=auth_manager,
+                        )
+                        if ok:
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
     with tab_audit:
         af1, af2, af3 = st.columns([1.4, 1.0, 1.2])
         with af1:
@@ -1380,7 +1525,7 @@ elif page == "🛡️ 权限与审计":
         with af3:
             audit_action_f = st.selectbox(
                 "事件类型",
-                ["ALL", "RAG_DENY", "RAG_QUERY", "RAG_LEVEL3_QUERY", "LOGIN_OK", "LOGIN_FAIL", "DOC_EXPORT", "ADMIN_CREATE_USER", "ADMIN_UPDATE_USER"],
+                ["ALL", "RAG_DENY", "RAG_QUERY", "RAG_LEVEL3_QUERY", "DOC_UPLOAD", "DOC_ACL_UPDATE", "DOC_DELETE", "DOC_EXPORT", "LOGIN_OK", "LOGIN_FAIL", "ADMIN_CREATE_USER", "ADMIN_UPDATE_USER"],
                 label_visibility="collapsed",
                 key="audit_act_f",
             )
@@ -1508,14 +1653,17 @@ elif page == "📊 评测基准与算力消融":
 # 页面 4：多源知识库画像
 # =====================================================================
 else:
-    st.subheader("🏛️ 企业知识底座数据画像 (EnterpriseRAG-Bench 1,000 核心精选)")
-    c1, c2, c3 = st.columns(3)
+    st.subheader("🏛️ 企业知识底座数据画像（结构感知切片 + 动态热入库）")
+    uploaded_cnt = len(doc_ingestor.list_uploaded_documents())
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.info("📚 **已索引核心文档**: 1,000 篇")
+        st.info(f"📚 **总父文档数**: {len(pipeline.parent_chunks_map):,} 篇")
     with c2:
-        st.info("🏢 **覆盖企业域**: 9 个完整业务系统")
+        st.info(f"🧩 **结构化切片数**: {len(pipeline.doc_metadata):,} 块")
     with c3:
-        st.info("⚡ **平均检索响应**: < 0.1 秒")
+        st.info(f"📤 **在线上传文档**: {uploaded_cnt} 篇")
+    with c4:
+        st.info("⚡ **平均检索响应**: < 0.15 秒")
 
     source_stats = {
         "Confluence (内部Wiki与架构决策ADR)": 130,
