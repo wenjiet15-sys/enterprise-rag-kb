@@ -1,7 +1,6 @@
 # src/doc_generator.py
 import os
 import re
-import time
 from typing import List, Dict, Any, Tuple
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor

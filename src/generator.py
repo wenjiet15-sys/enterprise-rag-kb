@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import json
 import time
 from typing import List, Dict, Any, Optional
 import openai
@@ -116,15 +115,15 @@ class LightweightSLMGenerator:
     def __init__(self, model_name: str = "deepseek-chat"):
         self.model_name = model_name
 
-    def generate(
+    def _build_messages(
         self,
         query: str,
         context_docs: List[Dict[str, Any]] = None,
         history_context: str = "",
         history_messages: Optional[List[Dict[str, str]]] = None,
         memory_context: str = "",
-        system_prompt: Optional[str] = None
-    ) -> Dict[str, Any]:
+        system_prompt: Optional[str] = None,
+    ):
         docs = context_docs or []
         sanitized_history = _sanitize_history_messages(history_messages)
 
@@ -170,26 +169,44 @@ class LightweightSLMGenerator:
             messages = [{"role": "system", "content": sys_msg}]
             messages.extend(sanitized_history)
             messages.append({"role": "user", "content": user_prompt})
-            temp = 0.3
+            return messages, 0.3
+
         # 分支 2：无检索文档（日常普通问答模式，原生多轮消息 + 记忆注入）
-        else:
-            messages = []
-            sys_parts = []
-            if system_prompt:
-                sys_parts.append(system_prompt.strip())
-            elif sanitized_history or (memory_context and memory_context.strip()) or (history_context and history_context.strip()):
-                sys_parts.append("你是一位专业、自然且具备多轮对话记忆能力的智能助手。请结合历史对话与已知记忆连贯地回答用户问题。")
+        messages = []
+        sys_parts = []
+        if system_prompt:
+            sys_parts.append(system_prompt.strip())
+        elif sanitized_history or (memory_context and memory_context.strip()) or (history_context and history_context.strip()):
+            sys_parts.append("你是一位专业、自然且具备多轮对话记忆能力的智能助手。请结合历史对话与已知记忆连贯地回答用户问题。")
 
-            if memory_context and memory_context.strip():
-                sys_parts.append(memory_context.strip())
-            elif not sanitized_history and history_context and history_context.strip():
-                sys_parts.append(history_context.strip())
+        if memory_context and memory_context.strip():
+            sys_parts.append(memory_context.strip())
+        elif not sanitized_history and history_context and history_context.strip():
+            sys_parts.append(history_context.strip())
 
-            if sys_parts:
-                messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
-            messages.extend(sanitized_history)
-            messages.append({"role": "user", "content": query})
-            temp = 0.7
+        if sys_parts:
+            messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
+        messages.extend(sanitized_history)
+        messages.append({"role": "user", "content": query})
+        return messages, 0.7
+
+    def generate(
+        self,
+        query: str,
+        context_docs: List[Dict[str, Any]] = None,
+        history_context: str = "",
+        history_messages: Optional[List[Dict[str, str]]] = None,
+        memory_context: str = "",
+        system_prompt: Optional[str] = None
+    ) -> Dict[str, Any]:
+        messages, temp = self._build_messages(
+            query=query,
+            context_docs=context_docs,
+            history_context=history_context,
+            history_messages=history_messages,
+            memory_context=memory_context,
+            system_prompt=system_prompt,
+        )
 
         t0 = time.time()
         try:
@@ -218,6 +235,63 @@ class LightweightSLMGenerator:
                 "latency": round(latency, 3),
                 "is_fallback": True,
                 "error": str(e)
+            }
+
+    def generate_stream(
+        self,
+        query: str,
+        context_docs: List[Dict[str, Any]] = None,
+        history_context: str = "",
+        history_messages: Optional[List[Dict[str, str]]] = None,
+        memory_context: str = "",
+        system_prompt: Optional[str] = None,
+    ):
+        """Level 2 原生流式生成器：逐 chunk 推送正文 delta，最后推送 done/error"""
+        messages, temp = self._build_messages(
+            query=query,
+            context_docs=context_docs,
+            history_context=history_context,
+            history_messages=history_messages,
+            memory_context=memory_context,
+            system_prompt=system_prompt,
+        )
+        t0 = time.time()
+        chunks_buf: List[str] = []
+        try:
+            stream = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temp,
+                max_tokens=2048,
+                stream=True,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = getattr(chunk.choices[0], "delta", None)
+                piece = getattr(delta, "content", None) if delta is not None else None
+                if piece:
+                    chunks_buf.append(piece)
+                    yield {"type": "content", "delta": piece}
+            full_text = "".join(chunks_buf)
+            yield {
+                "type": "done",
+                "tier": 2,
+                "model": self.model_name,
+                "content": full_text,
+                "latency": round(time.time() - t0, 3),
+                "is_fallback": False,
+                "error": None,
+            }
+        except Exception as e:
+            yield {
+                "type": "error",
+                "tier": 2,
+                "model": self.model_name,
+                "content": "".join(chunks_buf),
+                "latency": round(time.time() - t0, 3),
+                "is_fallback": True,
+                "error": str(e),
             }
 
     def summarize_history(self, previous_summary: str, messages_to_fold: List[Dict[str, Any]]) -> str:
@@ -286,15 +360,15 @@ class HeavyReasoningLLMGenerator:
     def __init__(self, model_name: str = "deepseek-reasoner"):
         self.model_name = model_name
 
-    def generate_joint_consultation(
+    def _build_consultation_messages(
         self,
         query: str,
         context_docs: List[Dict[str, Any]] = None,
         history_context: str = "",
         history_messages: Optional[List[Dict[str, str]]] = None,
         memory_context: str = "",
-        system_prompt: Optional[str] = None
-    ) -> Dict[str, Any]:
+        system_prompt: Optional[str] = None,
+    ):
         docs = context_docs or []
         sanitized_history = _sanitize_history_messages(history_messages)
         context_blocks = []
@@ -343,6 +417,25 @@ class HeavyReasoningLLMGenerator:
         messages = [{"role": "system", "content": sys_msg}]
         messages.extend(sanitized_history)
         messages.append({"role": "user", "content": user_prompt})
+        return messages, docs
+
+    def generate_joint_consultation(
+        self,
+        query: str,
+        context_docs: List[Dict[str, Any]] = None,
+        history_context: str = "",
+        history_messages: Optional[List[Dict[str, str]]] = None,
+        memory_context: str = "",
+        system_prompt: Optional[str] = None
+    ) -> Dict[str, Any]:
+        messages, docs = self._build_consultation_messages(
+            query=query,
+            context_docs=context_docs,
+            history_context=history_context,
+            history_messages=history_messages,
+            memory_context=memory_context,
+            system_prompt=system_prompt,
+        )
 
         t0 = time.time()
         api_success = False
@@ -388,6 +481,88 @@ class HeavyReasoningLLMGenerator:
             "latency": round(latency, 3),
             "is_fallback": is_fallback,
             "error": error_msg
+        }
+
+    def generate_joint_consultation_stream(
+        self,
+        query: str,
+        context_docs: List[Dict[str, Any]] = None,
+        history_context: str = "",
+        history_messages: Optional[List[Dict[str, str]]] = None,
+        memory_context: str = "",
+        system_prompt: Optional[str] = None,
+    ):
+        """Level 3 重型推理双流式生成器：实时推送 reasoning_content（思维链）与 content（正文）"""
+        messages, docs = self._build_consultation_messages(
+            query=query,
+            context_docs=context_docs,
+            history_context=history_context,
+            history_messages=history_messages,
+            memory_context=memory_context,
+            system_prompt=system_prompt,
+        )
+
+        t0 = time.time()
+        content_buf: List[str] = []
+        reasoning_buf: List[str] = []
+        api_success = False
+        error_msg = None
+
+        try:
+            stream = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=4096,
+                stream=True,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = getattr(chunk.choices[0], "delta", None)
+                if delta is None:
+                    continue
+                r_piece = getattr(delta, "reasoning_content", None)
+                if r_piece:
+                    reasoning_buf.append(r_piece)
+                    yield {"type": "reasoning", "delta": r_piece}
+                c_piece = getattr(delta, "content", None)
+                if c_piece:
+                    content_buf.append(c_piece)
+                    yield {"type": "content", "delta": c_piece}
+            api_success = True
+        except Exception as e:
+            error_msg = str(e)
+
+        content_text = "".join(content_buf)
+        reasoning_text = "".join(reasoning_buf)
+        latency = time.time() - t0
+
+        if not api_success or not content_text.strip() or "[DeepSeek Error]" in content_text:
+            simulated = self._simulate_heavy_reasoning(query, docs, history_context)
+            content_text = simulated["content"]
+            reasoning_text = simulated["reasoning_content"]
+            tool_traces = simulated["tool_traces"]
+            conflict_matrix = simulated["conflict_matrix"]
+            is_fallback = True
+            yield {"type": "reasoning", "delta": reasoning_text, "replace": True}
+            yield {"type": "content", "delta": content_text, "replace": True}
+        else:
+            tool_traces = self._build_tool_traces(query, docs)
+            conflict_matrix = self._build_conflict_matrix(query, docs)
+            is_fallback = False
+
+        yield {
+            "type": "done",
+            "tier": 3,
+            "model": self.model_name,
+            "content": content_text,
+            "reasoning_content": reasoning_text,
+            "tool_traces": tool_traces,
+            "conflict_matrix": conflict_matrix,
+            "latency": round(latency, 3),
+            "is_fallback": is_fallback,
+            "error": error_msg,
         }
 
     def _build_tool_traces(self, query: str, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -517,33 +692,13 @@ class HeavyReasoningLLMGenerator:
 class DeepSeekGenerator:
     """
     统一大模型调用门面 (Facade)，封装算力分层调度：
-    - Level 1: generate_direct (0算力直出/轻量通用)
-    - Level 2: generate_answer / generate_lightweight_answer (轻量化专科SLM)
-    - Level 3: generate_heavy_reasoning / generate_joint_consultation (重型深度推理LLM)
+    - Level 2: generate_answer / generate_lightweight_answer / generate_lightweight_stream (轻量化专科SLM)
+    - Level 3: generate_heavy_reasoning / generate_heavy_reasoning_stream (重型深度推理LLM)
     """
     def __init__(self, model_name: str = "deepseek-chat"):
         self.model_name = model_name
         self.slm_generator = LightweightSLMGenerator(model_name="deepseek-chat")
         self.heavy_generator = HeavyReasoningLLMGenerator(model_name="deepseek-reasoner")
-
-    def generate_direct(self, query: str) -> str:
-        """日常普通问答直连大模型（不注入任何多余预设提示词或外部文档）"""
-        try:
-            resp = client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.7,
-                max_tokens=2048
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            return f"[DeepSeek Error]: {str(e)}"
-
-    def generate_general_response(self, prompt: str) -> str:
-        """兼容通用直连调用"""
-        return self.generate_direct(prompt)
 
     def generate_answer(
         self,
@@ -603,6 +758,44 @@ class DeepSeekGenerator:
             history_messages=history_messages,
             memory_context=memory_context,
             system_prompt=system_prompt
+        )
+
+    def generate_lightweight_stream(
+        self,
+        query: str,
+        context_docs: List[Dict[str, Any]] = None,
+        history_context: str = "",
+        history_messages: Optional[List[Dict[str, str]]] = None,
+        memory_context: str = "",
+        system_prompt: str = None,
+    ):
+        """Level 2 流式输出入口"""
+        return self.slm_generator.generate_stream(
+            query=query,
+            context_docs=context_docs,
+            history_context=history_context,
+            history_messages=history_messages,
+            memory_context=memory_context,
+            system_prompt=system_prompt,
+        )
+
+    def generate_heavy_reasoning_stream(
+        self,
+        query: str,
+        context_docs: List[Dict[str, Any]] = None,
+        history_context: str = "",
+        history_messages: Optional[List[Dict[str, str]]] = None,
+        memory_context: str = "",
+        system_prompt: str = None,
+    ):
+        """Level 3 流式输出入口（含思维链 CoT + 正文双流）"""
+        return self.heavy_generator.generate_joint_consultation_stream(
+            query=query,
+            context_docs=context_docs,
+            history_context=history_context,
+            history_messages=history_messages,
+            memory_context=memory_context,
+            system_prompt=system_prompt,
         )
 
     def summarize_conversation(self, previous_summary: str, messages_to_fold: List[Dict[str, Any]]) -> str:

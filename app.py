@@ -2,10 +2,8 @@
 import streamlit as st
 import os
 import sys
-import json
 import html
 import uuid
-import importlib
 from datetime import datetime
 import pandas as pd
 
@@ -23,10 +21,6 @@ from src.access_control import (
     CLEARANCE_LABELS,
     SOURCE_TYPE_LABELS,
 )
-from src.generator import MODEL_TIER_PROFILES
-import src.generator as _gen_mod
-
-importlib.reload(_gen_mod)
 
 st.set_page_config(
     page_title="企业智能知识库与大模型对话助手",
@@ -552,6 +546,56 @@ st.markdown("""
         color: #6b7280;
         margin-bottom: 28px;
     }
+
+    /* 流式输出阶段状态与实时思维链样式 */
+    .stream-status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: #f5f7ff;
+        color: #4f46e5;
+        border: 1px solid #e0e7ff;
+        border-radius: 999px;
+        padding: 4px 12px;
+        font-size: 12.5px;
+        font-weight: 500;
+        margin: 6px 0 10px 0;
+    }
+    .stream-cot-box {
+        background: #f8fafc;
+        border-left: 3px solid #6366f1;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin: 6px 0 12px 0;
+        font-size: 12.5px;
+        color: #475569;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        max-height: 240px;
+        overflow-y: auto;
+    }
+    .stream-cot-title {
+        font-size: 12px;
+        font-weight: 600;
+        color: #4f46e5;
+        margin-bottom: 4px;
+    }
+    .ai-mode-pill-rewrite {
+        background: #eef2ff;
+        color: #4338ca;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11.5px;
+        font-weight: 500;
+    }
+    .ai-mode-pill-rewrite-guard {
+        background: #fffbeb;
+        color: #b45309;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11.5px;
+        font-weight: 500;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -584,7 +628,6 @@ def load_doc_ingestor(_engine):
 
 
 pipeline = load_pipeline()
-pipeline.generator = _gen_mod.DeepSeekGenerator()
 doc_gen = load_doc_generator()
 memory_store = load_memory_store()
 auth_manager = load_auth_manager(memory_store.engine)
@@ -738,26 +781,8 @@ if "turn_extras" not in st.session_state:
 session = st.session_state["session_state"]
 
 
-def process_user_message(
-    user_text: str,
-    mode_key: str,
-    top_k: int,
-    source_arg,
-    use_ltm: bool = True,
-    auto_extract_ltm: bool = True,
-):
-    """处理当前员工发送的消息，透传 UserContext 执行检索前权限过滤并落库 MySQL"""
-    res = pipeline.answer_question(
-        query=user_text.strip(),
-        mode=mode_key,
-        top_k=top_k,
-        source_filter=source_arg,
-        session=session,
-        user_id=CURRENT_USER_ID,
-        user_ctx=current_user,
-        use_long_term_memory=use_ltm,
-        auto_extract_memory=auto_extract_ltm,
-    )
+def _finalize_turn_result(res: dict):
+    """将本轮问答结果同步至 session_state 并落库 MySQL（流式与非流式共用）"""
     is_reset = (res.get("funnel_res", {}).get("action") == "session_reset")
     if is_reset:
         st.session_state["turn_extras"] = {}
@@ -770,6 +795,14 @@ def process_user_message(
         "skipped_retrieval": res.get("skipped_retrieval", False),
         "access_denied": res.get("access_denied", False),
         "blocked_docs_count": res.get("blocked_docs_count", 0),
+        "rewritten_query": res.get("rewritten_query", ""),
+        "candidate_rewritten_query": res.get("candidate_rewritten_query", ""),
+        "search_queries": res.get("search_queries", []),
+        "rewrite_used": res.get("rewrite_used", False),
+        "rewrite_reason": res.get("rewrite_reason", ""),
+        "rewrite_confidence": res.get("rewrite_confidence", 1.0),
+        "rewrite_status": res.get("rewrite_status", "skipped"),
+        "reject_reason": res.get("reject_reason", ""),
         "reasoning_content": res.get("reasoning_content", ""),
         "tool_traces": res.get("tool_traces", []),
         "conflict_matrix": res.get("conflict_matrix", []),
@@ -784,6 +817,145 @@ def process_user_message(
         user_id=CURRENT_USER_ID,
         force_rewrite_messages=is_reset,
     )
+
+
+def process_user_message(
+    user_text: str,
+    mode_key: str,
+    top_k: int,
+    source_arg,
+    use_ltm: bool = True,
+    auto_extract_ltm: bool = True,
+    enable_query_rewrite: bool = True,
+    rewrite_confidence_threshold: float = 0.70,
+):
+    """非流式处理当前员工发送的消息，透传 UserContext 执行检索前权限过滤并落库 MySQL"""
+    res = pipeline.answer_question(
+        query=user_text.strip(),
+        mode=mode_key,
+        top_k=top_k,
+        source_filter=source_arg,
+        session=session,
+        user_id=CURRENT_USER_ID,
+        user_ctx=current_user,
+        use_long_term_memory=use_ltm,
+        auto_extract_memory=auto_extract_ltm,
+        enable_query_rewrite=enable_query_rewrite,
+        rewrite_confidence_threshold=rewrite_confidence_threshold,
+    )
+    _finalize_turn_result(res)
+
+
+def _build_rewrite_tag_html(
+    orig_q: str,
+    rew_q: str,
+    search_queries: list,
+    rewrite_used: bool,
+    rw_status: str,
+    rw_conf: float,
+    rej_reason: str = "",
+    history_used: bool = False,
+) -> str:
+    """统一生成用户气泡下方的问题改写/置信度护栏提示 HTML（流式与历史复用）"""
+    if rw_status == "rejected":
+        tag_text = f"🛡️ 改写已拦截并回退原问句（置信度 {rw_conf:.2f} · {html.escape(rej_reason)}）"
+    elif rw_status == "soft_fallback":
+        tag_text = f"🛡️ 改写置信度偏低 ({rw_conf:.2f})，已保留原问句并低权重辅助检索"
+    elif (history_used and rew_q and rew_q != orig_q) or (rewrite_used and (rew_q != orig_q or len(search_queries) > 1)):
+        if rew_q and rew_q != orig_q:
+            extra_cnt = f" · 扩展 {len(search_queries)} 路检索" if len(search_queries) > 1 else ""
+            tag_text = f"✨ 智能改写 (置信度 {rw_conf:.2f})：「{html.escape(rew_q)}」{extra_cnt}"
+        else:
+            extra_qs = [q for q in search_queries if q != orig_q]
+            preview = " / ".join(extra_qs[:2])
+            tag_text = f"✨ 跨语检索扩展 (置信度 {rw_conf:.2f})：「{html.escape(preview)}」"
+    else:
+        return ""
+    return f'<div class="rewrite-tag-row"><span class="rewrite-tag">{tag_text}</span></div>'
+
+
+def process_user_message_stream(
+    user_text: str,
+    mode_key: str,
+    top_k: int,
+    source_arg,
+    use_ltm: bool = True,
+    auto_extract_ltm: bool = True,
+    enable_query_rewrite: bool = True,
+    rewrite_confidence_threshold: float = 0.70,
+):
+    """全链路流式打字机处理：实时展示改写结果、置信度护栏状态、Level 3 思维链与 Markdown 逐字输出"""
+    rewrite_ph = st.empty()
+    status_ph = st.empty()
+    cot_ph = st.empty()
+    answer_ph = st.empty()
+
+    answer_acc = ""
+    reasoning_acc = ""
+    final_res = None
+
+    for ev in pipeline.answer_question_stream(
+        query=user_text.strip(),
+        mode=mode_key,
+        top_k=top_k,
+        source_filter=source_arg,
+        session=session,
+        user_id=CURRENT_USER_ID,
+        user_ctx=current_user,
+        use_long_term_memory=use_ltm,
+        auto_extract_memory=auto_extract_ltm,
+        enable_query_rewrite=enable_query_rewrite,
+        rewrite_confidence_threshold=rewrite_confidence_threshold,
+    ):
+        ev_type = ev.get("type")
+        if ev_type == "status":
+            status_text = html.escape(ev.get("text", "正在处理..."))
+            status_ph.markdown(f'<div class="stream-status-pill">{status_text}</div>', unsafe_allow_html=True)
+        elif ev_type == "rewrite":
+            tag_html = _build_rewrite_tag_html(
+                orig_q=ev.get("original_query", ""),
+                rew_q=ev.get("rewritten_query", ""),
+                search_queries=ev.get("search_queries") or [],
+                rewrite_used=bool(ev.get("rewrite_used", False)),
+                rw_status=ev.get("rewrite_status", "skipped"),
+                rw_conf=float(ev.get("rewrite_confidence", 1.0) or 0.0),
+                rej_reason=ev.get("reject_reason", ""),
+            )
+            if tag_html:
+                rewrite_ph.markdown(tag_html, unsafe_allow_html=True)
+        elif ev_type == "reasoning":
+            delta = ev.get("delta", "")
+            if ev.get("replace"):
+                reasoning_acc = delta
+            else:
+                reasoning_acc += delta
+            if reasoning_acc.strip():
+                cot_ph.markdown(
+                    f'<div class="stream-cot-box"><div class="stream-cot-title">🧠 深度思考过程（实时流式推演）</div>{html.escape(reasoning_acc)}▌</div>',
+                    unsafe_allow_html=True,
+                )
+        elif ev_type == "content":
+            delta = ev.get("delta", "")
+            if ev.get("replace"):
+                answer_acc = delta
+            else:
+                answer_acc += delta
+            # 开始输出正文后清空临时状态胶囊，并收敛思考框光标
+            status_ph.empty()
+            if reasoning_acc.strip():
+                cot_ph.markdown(
+                    f'<div class="stream-cot-box"><div class="stream-cot-title">🧠 深度思考完成</div>{html.escape(reasoning_acc)}</div>',
+                    unsafe_allow_html=True,
+                )
+            answer_ph.markdown(answer_acc + "▌")
+        elif ev_type == "done":
+            final_res = ev.get("result")
+
+    status_ph.empty()
+    if answer_acc:
+        answer_ph.markdown(answer_acc)
+    if final_res is not None:
+        _finalize_turn_result(final_res)
 
 
 # =====================================================================
@@ -870,6 +1042,26 @@ with st.sidebar:
 
     # 知识库检索与记忆设置（数据源过滤仅展示当前角色已授权的数据源）
     with st.expander("⚙️ 知识库检索与记忆设置", expanded=False):
+        enable_query_rewrite = st.toggle(
+            "启用智能问题改写（指代消解+跨语扩展）",
+            value=True,
+            help="多轮追问自动消解代词指代；中文问英文企业库时自动扩展英文检索词",
+        )
+        rewrite_conf_threshold = st.slider(
+            "改写置信度过滤阈值",
+            min_value=0.45,
+            max_value=0.95,
+            value=0.70,
+            step=0.05,
+            disabled=not enable_query_rewrite,
+            help="融合 LLM 自评与规则实体保真分：高于阈值采纳改写，中置信度保留原句低权辅检，低置信度或触发硬护栏直接拦截回退",
+        )
+        enable_streaming = st.toggle(
+            "启用流式打字机输出",
+            value=True,
+            help="实时逐字输出回答与 Level 3 深度思考过程，降低首字等待延迟",
+        )
+        st.divider()
         use_ltm = st.toggle("启用跨会话长期记忆召回", value=True, help="自动将 MySQL 中的个人画像、偏好与相关记忆注入上下文")
         auto_extract_ltm = st.toggle("启用高信号自动抽取记忆", value=True, help="仅对自我介绍、偏好、项目背景等高信号发言触发轻量抽取")
         st.divider()
@@ -932,17 +1124,18 @@ if page == "💬 主对话":
     # 上方区域：历史对话流（或空状态欢迎页）
     # -----------------------------------------------------------------
     chat_container = st.container()
+    pending_quick_prompt = st.session_state.pop("pending_quick_prompt", None)
 
     with chat_container:
         if session.rolling_summary:
             with st.expander("📝 查看本会话早期对话滚动摘要（自动压缩记忆）", expanded=False):
                 st.markdown(session.rolling_summary)
 
-        if len(history_turns) == 0:
+        if len(history_turns) == 0 and not pending_quick_prompt:
             st.markdown("""
             <div class="welcome-empty-box">
                 <div class="welcome-title">你好，有什么可以帮你的？</div>
-                <div class="welcome-desc">日常对话直连 DeepSeek；企业工单与规范自动 RAG 检索；支持多轮上下文与跨会话 MySQL 长期记忆</div>
+                <div class="welcome-desc">日常对话直连 DeepSeek；企业工单与规范自动 RAG 检索；支持多轮问题改写、流式打字机与跨会话 MySQL 长期记忆</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -953,14 +1146,13 @@ if page == "💬 主对话":
                 ("🧠 长期记忆：记住我是负责美西集群的架构师，以后回答请简洁并给要点", "记住：我是负责美西集群的架构师，以后回答请简洁并给要点"),
                 ("💬 日常问答：用通俗的话解释一下快速排序", "用通俗的话解释一下快速排序"),
                 ("📚 知识库检索：查询工单 ENG-39100 的最新状态", "查询工单 ENG-39100 的最新状态"),
-                ("📚 知识库检索：What are the allowed regions for deploying the v2 cluster in us-west?", "What are the allowed regions for deploying the v2 cluster in us-west?"),
+                ("🌐 跨语检索：美西 v2 集群允许部署在哪些区域？", "美西 v2 集群允许部署在哪些区域？"),
             ]
             for idx, (label, q_text) in enumerate(sample_questions):
                 target_col = q_col1 if idx % 2 == 0 else q_col2
                 with target_col:
                     if st.button(label, key=f"quick_q_{idx}", use_container_width=True):
-                        with st.spinner("思考中..."):
-                            process_user_message(q_text, mode_key, top_k, source_arg, use_ltm=use_ltm, auto_extract_ltm=auto_extract_ltm)
+                        st.session_state["pending_quick_prompt"] = q_text
                         st.rerun()
 
         else:
@@ -980,6 +1172,12 @@ if page == "💬 主对话":
                 mem_events = extras.get("memory_events", [])
                 is_denied = extras.get("access_denied", False) or (t_stage == "权限拦截拒答")
                 blocked_cnt = int(extras.get("blocked_docs_count", 0) or 0)
+                search_queries = extras.get("search_queries") or []
+                rewrite_used = bool(extras.get("rewrite_used", False))
+                ext_rew = extras.get("rewritten_query") or t_rew
+                rw_status = extras.get("rewrite_status", "skipped")
+                rw_conf = float(extras.get("rewrite_confidence", 1.0) or 0.0)
+                rej_reason = extras.get("reject_reason", "")
 
                 # 1. 用户消息（右对齐浅灰圆角气泡，与豆包一致）
                 st.markdown(f"""
@@ -988,19 +1186,25 @@ if page == "💬 主对话":
                 </div>
                 """, unsafe_allow_html=True)
 
-                # 若触发了多轮指代消解，在气泡下方显示一行小巧提示
-                if t_used and t_rew and t_rew != t_orig:
-                    st.markdown(f"""
-                    <div class="rewrite-tag-row">
-                        <span class="rewrite-tag">🩺 指代消解补全：「{html.escape(t_rew)}」</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                # 若触发了多轮指代消解、跨语扩展或置信度拦截回退，在气泡下方显示一行小巧提示
+                tag_html = _build_rewrite_tag_html(
+                    orig_q=t_orig,
+                    rew_q=ext_rew,
+                    search_queries=search_queries,
+                    rewrite_used=rewrite_used,
+                    rw_status=rw_status,
+                    rw_conf=rw_conf,
+                    rej_reason=rej_reason,
+                    history_used=t_used,
+                )
+                if tag_html:
+                    st.markdown(tag_html, unsafe_allow_html=True)
 
                 # 2. AI 回答正文（左对齐纯净排版，与豆包一致）
                 st.markdown('<div class="ai-msg-container">', unsafe_allow_html=True)
                 st.markdown(t_ans)
 
-                # 底部轻量状态行（模式徽章 + 权限过滤/拦截胶囊 + 记忆召回/写入胶囊 + 耗时）
+                # 底部轻量状态行（模式徽章 + 权限过滤/拦截胶囊 + 智能改写/护栏胶囊 + 记忆召回/写入胶囊 + 耗时）
                 if is_denied:
                     mode_badge = '<span class="ai-mode-pill-deny">🔒 权限不足拦截 · 已记入审计</span>'
                 elif t_stage == "长期记忆指令":
@@ -1011,6 +1215,12 @@ if page == "💬 主对话":
                     mode_badge = '<span class="ai-mode-pill">⚡ DeepSeek 大模型直连</span>'
 
                 mem_badges = []
+                if rw_status in ("rejected", "soft_fallback") and not is_denied:
+                    guard_lbl = "改写护栏回退" if rw_status == "rejected" else "改写降权辅检"
+                    mem_badges.append(f'<span class="ai-mode-pill-rewrite-guard">🛡️ {guard_lbl} · {rw_conf:.2f}</span>')
+                elif rewrite_used and not is_denied:
+                    q_cnt_str = f" · {len(search_queries)} 路" if len(search_queries) > 1 else ""
+                    mem_badges.append(f'<span class="ai-mode-pill-rewrite">✨ 智能改写 ({rw_conf:.2f}){q_cnt_str}</span>')
                 if not is_denied and blocked_cnt > 0 and t_docs_count > 0:
                     mem_badges.append(
                         f'<span class="ai-mode-pill-shield">🛡️ 已前置过滤 {blocked_cnt} 篇无权文档</span>'
@@ -1061,10 +1271,14 @@ if page == "💬 主对话":
                                     c_label = MEMORY_CATEGORY_LABELS.get(ev.get("category", "custom"), "记忆")
                                     st.markdown(f"- `{act_cn}` `[{c_label}]` {ev.get('content', '')}")
 
-                # 3. 如果该轮调用了 RAG 知识库，提供可折叠的参考文档卡片（精确展示章节路径与命中段落）
+                # 3. 如果该轮调用了 RAG 知识库，提供可折叠的参考文档卡片（精确展示章节路径、命中段落与多路检索词）
                 turn_docs = extras.get("docs", [])
                 if turn_docs:
                     with st.expander(f"📄 查看本轮检索到的 {len(turn_docs)} 个已授权知识片段", expanded=False):
+                        if len(search_queries) > 1 or (ext_rew and ext_rew != t_orig):
+                            q_list_str = " | ".join(f"`{q}`" for q in (search_queries or [ext_rew]))
+                            st.markdown(f"🔍 **实际执行检索词：** {q_list_str}")
+                            st.markdown("---")
                         for i, doc in enumerate(turn_docs, 1):
                             sec_lvl = doc.get("security_level", 1)
                             sec_path = doc.get("section_path") or ""
@@ -1094,16 +1308,38 @@ if page == "💬 主对话":
     # 下方区域：底部悬浮大圆角提问输入框（仿豆包底部输入框）
     # -----------------------------------------------------------------
     prompt = st.chat_input("发消息，输入企业知识库问题，或说「记住：…」写入长期记忆...")
-    if prompt and prompt.strip():
+    active_prompt = prompt.strip() if (prompt and prompt.strip()) else (pending_quick_prompt.strip() if pending_quick_prompt else "")
+    if active_prompt:
         # 先在界面即时渲染用户刚发出的右侧气泡
         with chat_container:
             st.markdown(f"""
             <div class="user-msg-row">
-                <div class="user-msg-bubble">{html.escape(prompt.strip())}</div>
+                <div class="user-msg-bubble">{html.escape(active_prompt)}</div>
             </div>
             """, unsafe_allow_html=True)
-            with st.spinner("正在思考..."):
-                process_user_message(prompt.strip(), mode_key, top_k, source_arg, use_ltm=use_ltm, auto_extract_ltm=auto_extract_ltm)
+            if enable_streaming:
+                process_user_message_stream(
+                    active_prompt,
+                    mode_key,
+                    top_k,
+                    source_arg,
+                    use_ltm=use_ltm,
+                    auto_extract_ltm=auto_extract_ltm,
+                    enable_query_rewrite=enable_query_rewrite,
+                    rewrite_confidence_threshold=rewrite_conf_threshold,
+                )
+            else:
+                with st.spinner("正在思考..."):
+                    process_user_message(
+                        active_prompt,
+                        mode_key,
+                        top_k,
+                        source_arg,
+                        use_ltm=use_ltm,
+                        auto_extract_ltm=auto_extract_ltm,
+                        enable_query_rewrite=enable_query_rewrite,
+                        rewrite_confidence_threshold=rewrite_conf_threshold,
+                    )
         st.rerun()
 
 

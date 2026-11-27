@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # src/chunker.py
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 
 from src.access_control import classify_document_acl
 

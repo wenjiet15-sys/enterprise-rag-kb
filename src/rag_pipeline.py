@@ -9,6 +9,7 @@ from src.hybrid_reranker import HybridReranker
 from src.generator import DeepSeekGenerator, MODEL_TIER_PROFILES
 from src.intent_router import ProgressiveFunnelRouter, SessionState
 from src.memory_manager import LongTermMemoryManager
+from src.query_rewriter import QueryRewriter
 from src.access_control import (
     UserContext,
     SOURCE_TYPE_LABELS,
@@ -31,6 +32,7 @@ class EnterpriseRAGPipeline:
         self.vector_retriever = VectorRetriever()
         self.reranker = HybridReranker(self.bm25_retriever, self.vector_retriever)
         self.generator = DeepSeekGenerator()
+        self.query_rewriter = QueryRewriter()
         self.memory_manager: Optional[LongTermMemoryManager] = None
         self.auth_manager = auth_manager
         if memory_store is not None:
@@ -264,6 +266,147 @@ class EnterpriseRAGPipeline:
             return self._expand_small_to_big(docs, user_ctx=user_ctx)
         return docs
 
+    def retrieve_multi_query(
+        self,
+        queries: List[str],
+        top_k: int = 5,
+        mode: str = "hybrid",
+        domain_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+        user_ctx: Optional[UserContext] = None,
+        max_chunks_per_doc: int = 2,
+        query_weights: Optional[List[float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Multi-Query 跨语/等价检索加权融合：
+        对主改写句与扩展检索词分别执行检索前 ACL 过滤召回，按 chunk_id 做加权 RRF 融合，
+        限制单篇父文档配额后再执行 Small-to-Big 上下文扩展。
+        """
+        clean_queries = [q.strip() for q in (queries or []) if q and q.strip()]
+        if not clean_queries:
+            return []
+        if len(clean_queries) == 1:
+            return self.retrieve(
+                clean_queries[0],
+                top_k=top_k,
+                mode=mode,
+                domain_filter=domain_filter,
+                source_filter=source_filter,
+                user_ctx=user_ctx,
+                expand_context=True,
+            )
+
+        rrf_scores: Dict[str, float] = {}
+        doc_map: Dict[str, Dict[str, Any]] = {}
+        per_q_k = max(top_k * 3, 12)
+        for q_idx, q in enumerate(clean_queries[:3]):
+            # 优先采用 QueryRewriter 置信度分级给出的权重；默认主问题 1.0，扩展词 0.75
+            if query_weights and q_idx < len(query_weights):
+                weight = float(query_weights[q_idx])
+            else:
+                weight = 1.0 if q_idx == 0 else 0.75
+            hits = self.retrieve(
+                q,
+                top_k=per_q_k,
+                mode=mode,
+                domain_filter=domain_filter,
+                source_filter=source_filter,
+                user_ctx=user_ctx,
+                expand_context=False,
+            )
+            for rank, d in enumerate(hits):
+                cid = d.get("chunk_id") or d.get("uuid")
+                rrf_scores[cid] = rrf_scores.get(cid, 0.0) + weight * (1.0 / (60 + rank + 1))
+                if cid not in doc_map:
+                    doc_map[cid] = d
+
+        ranked_ids = sorted(rrf_scores.keys(), key=lambda c: rrf_scores[c], reverse=True)
+        selected: List[Dict[str, Any]] = []
+        parent_counts: Dict[str, int] = {}
+        for cid in ranked_ids:
+            d = dict(doc_map[cid])
+            if user_ctx is not None and not can_access_document(user_ctx, d):
+                continue
+            pid = d.get("parent_doc_id") or d.get("uuid")
+            if max_chunks_per_doc > 0 and parent_counts.get(pid, 0) >= max_chunks_per_doc:
+                continue
+            parent_counts[pid] = parent_counts.get(pid, 0) + 1
+            d["rrf_score"] = round(rrf_scores[cid], 5)
+            d["score"] = d["rrf_score"]
+            selected.append(d)
+            if len(selected) >= top_k:
+                break
+
+        return self._expand_small_to_big(selected, user_ctx=user_ctx)
+
+    def _run_query_rewrite(
+        self,
+        query: str,
+        session: SessionState,
+        funnel_res: Dict[str, Any],
+        enable_query_rewrite: bool = True,
+        confidence_threshold: float = 0.70,
+    ) -> Dict[str, Any]:
+        """执行三阶门控 + 置信度护栏问题改写，并在指代补全命中企业实体时自动修正 needs_rag"""
+        needs_rag = bool(funnel_res.get("needs_rag", True))
+        rule_rewritten = funnel_res.get("rewritten_query", query)
+        if not enable_query_rewrite:
+            rule_changed = (rule_rewritten.strip() != query.strip())
+            return {
+                "actual_query": rule_rewritten,
+                "candidate_rewritten_query": rule_rewritten,
+                "search_queries": [rule_rewritten],
+                "query_weights": [1.0],
+                "rewrite_used": rule_changed,
+                "rewrite_reason": "规则指代补全" if rule_changed else "",
+                "rewrite_confidence": 1.0,
+                "rewrite_status": "accepted" if rule_changed else "skipped",
+                "reject_reason": "",
+                "needs_rag": needs_rag,
+            }
+
+        rw = self.query_rewriter.rewrite(
+            query=query,
+            session=session,
+            needs_rag=needs_rag,
+            rule_rewritten_query=rule_rewritten,
+            enable_multi_query=True,
+            confidence_threshold=confidence_threshold,
+        )
+        actual_q = rw["rewritten_query"]
+        search_qs = list(rw["search_queries"])
+        q_weights = list(rw.get("query_weights") or ([1.0] + [0.75] * (len(search_qs) - 1)))
+        rw_used = rw["rewrite_used"]
+        rw_reason = rw["rewrite_reason"]
+
+        # 若原本因为裸代词/省略未触发 RAG，但改写补全（含软回退辅助检索词）后出现了企业实体/术语，则自动升级开启 RAG
+        check_text = " ".join([actual_q] + search_qs).lower()
+        if not needs_rag and (actual_q != query or len(search_qs) > 1):
+            ent_clues = (
+                "eng-", "jira", "pr-", "github", "confluence", "hubspot", "slack",
+                "cluster", "集群", "部署", "工单", "容灾", "报价", "合同", "规范", "sla", "us-west", "us-east", "k8s",
+            )
+            if any(c in check_text for c in ent_clues):
+                needs_rag = True
+                if len(search_qs) == 1:
+                    extra = QueryRewriter._fallback_bilingual_queries(actual_q)
+                    if extra:
+                        search_qs = QueryRewriter._dedup_queries([actual_q] + extra)
+                        q_weights = [1.0] + [0.75] * (len(search_qs) - 1)
+
+        return {
+            "actual_query": actual_q,
+            "candidate_rewritten_query": rw.get("candidate_rewritten_query", actual_q),
+            "search_queries": search_qs,
+            "query_weights": q_weights,
+            "rewrite_used": rw_used,
+            "rewrite_reason": rw_reason,
+            "rewrite_confidence": rw.get("confidence", 1.0),
+            "rewrite_status": rw.get("rewrite_status", "skipped"),
+            "reject_reason": rw.get("reject_reason", ""),
+            "needs_rag": needs_rag,
+        }
+
     @staticmethod
     def _detect_restricted_target(query: str, user_ctx: Optional[UserContext]) -> Optional[str]:
         """检测用户是否显式查询了当前角色无权访问的受限数据源或高密级主题"""
@@ -427,7 +570,6 @@ class EnterpriseRAGPipeline:
         """
         Level 3: 多科室联合会诊重型推理输出 (跨源冲突仲裁与多步骤协同推演)
         """
-        target_entity = session.active_entity or "v2-cluster 跨AZ集群"
         return (
             f"👨‍⚕️ **【Level 3: 多科室联合专家会诊评估报告 (Heavy Reasoning LLM)】**\n\n"
             f"针对跨多源多系统复杂决策需求：「**{query}**」，系统已自动调度 **重型推理引擎 (DeepSeek-Reasoner)**，"
@@ -497,10 +639,79 @@ class EnterpriseRAGPipeline:
         user_ctx: Optional[UserContext] = None,
         use_long_term_memory: bool = True,
         auto_extract_memory: bool = True,
+        enable_query_rewrite: bool = True,
+        rewrite_confidence_threshold: float = 0.70,
     ) -> Dict[str, Any]:
-        """
-        基于三层渐进式漏斗架构、算力梯次配置、三层记忆系统与 RBAC/ACL 安全门禁的端到端问答
-        """
+        """非流式端到端问答（与流式共享同一套路由、改写、置信度护栏、RBAC 门禁与记忆持久化内核）"""
+        final_result: Dict[str, Any] = {}
+        for ev in self._execute_pipeline(
+            query=query,
+            session=session,
+            top_k=top_k,
+            mode=mode,
+            domain_filter=domain_filter,
+            source_filter=source_filter,
+            user_id=user_id,
+            user_ctx=user_ctx,
+            use_long_term_memory=use_long_term_memory,
+            auto_extract_memory=auto_extract_memory,
+            enable_query_rewrite=enable_query_rewrite,
+            rewrite_confidence_threshold=rewrite_confidence_threshold,
+            stream=False,
+        ):
+            if ev.get("type") == "done":
+                final_result = ev.get("result", {})
+        return final_result
+
+    def answer_question_stream(
+        self,
+        query: str,
+        session: Optional[SessionState] = None,
+        top_k: int = 5,
+        mode: str = "hybrid",
+        domain_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+        user_id: str = "default_user",
+        user_ctx: Optional[UserContext] = None,
+        use_long_term_memory: bool = True,
+        auto_extract_memory: bool = True,
+        enable_query_rewrite: bool = True,
+        rewrite_confidence_threshold: float = 0.70,
+    ):
+        """全链路流式问答生成器：依次推送 status / rewrite / meta / reasoning / content / done 事件"""
+        yield from self._execute_pipeline(
+            query=query,
+            session=session,
+            top_k=top_k,
+            mode=mode,
+            domain_filter=domain_filter,
+            source_filter=source_filter,
+            user_id=user_id,
+            user_ctx=user_ctx,
+            use_long_term_memory=use_long_term_memory,
+            auto_extract_memory=auto_extract_memory,
+            enable_query_rewrite=enable_query_rewrite,
+            rewrite_confidence_threshold=rewrite_confidence_threshold,
+            stream=True,
+        )
+
+    def _execute_pipeline(
+        self,
+        query: str,
+        session: Optional[SessionState] = None,
+        top_k: int = 5,
+        mode: str = "hybrid",
+        domain_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+        user_id: str = "default_user",
+        user_ctx: Optional[UserContext] = None,
+        use_long_term_memory: bool = True,
+        auto_extract_memory: bool = True,
+        enable_query_rewrite: bool = True,
+        rewrite_confidence_threshold: float = 0.70,
+        stream: bool = True,
+    ):
+        """统一三层漏斗问答内核（stream=True 走流式生成，stream=False 走同步生成）"""
         if session is None:
             session = SessionState("default_session")
         if user_ctx is not None:
@@ -510,9 +721,24 @@ class EnterpriseRAGPipeline:
         memory_events: List[Dict[str, Any]] = []
         explicit_mem_consumed = False
 
+        def _emit_denied(res: Dict[str, Any]):
+            yield {
+                "type": "meta",
+                "level": res.get("level", 2),
+                "funnel_res": res.get("funnel_res", {}),
+                "tier_profile": res.get("tier_profile", {}),
+                "docs": [],
+                "recalled_memories": [],
+                "access_denied": True,
+                "blocked_docs_count": res.get("blocked_docs_count", 0),
+                "skipped_retrieval": True,
+            }
+            yield {"type": "content", "delta": res.get("answer", ""), "replace": True}
+            yield {"type": "done", "result": res}
+
         # -1. 账号禁用硬拦截（Fail-Closed）
         if user_ctx is not None and not user_ctx.is_active:
-            return self._build_denied_result(
+            denied_res = self._build_denied_result(
                 query=query,
                 session=session,
                 user_ctx=user_ctx,
@@ -520,8 +746,10 @@ class EnterpriseRAGPipeline:
                 start_total=start_total,
                 blocked_docs_count=0,
             )
+            yield from _emit_denied(denied_res)
+            return
 
-        # 0. 显式长期记忆指令优先拦截（记住…… / 忘掉关于……的记忆）
+        # 0. 显式长期记忆指令优先拦截
         if self.memory_manager is not None:
             explicit_res = self.memory_manager.handle_explicit_command(
                 query=query,
@@ -546,7 +774,7 @@ class EnterpriseRAGPipeline:
                         original_query=query, rewritten_query=query,
                         model="长期记忆引擎(0大模型算力)", total_time=_tot, docs_count=0
                     )
-                    return {
+                    res = {
                         "level": 1,
                         "funnel_res": {
                             "level": 1,
@@ -570,6 +798,10 @@ class EnterpriseRAGPipeline:
                         "skipped_retrieval": True,
                         "access_denied": False,
                         "blocked_docs_count": 0,
+                        "rewritten_query": query,
+                        "search_queries": [query],
+                        "rewrite_used": False,
+                        "rewrite_reason": "explicit_memory_command",
                         "history_messages_count": 0,
                         "summary_updated": False,
                         "rolling_summary": session.rolling_summary,
@@ -577,25 +809,39 @@ class EnterpriseRAGPipeline:
                         "memory_events": memory_events,
                         "session_summary": session.get_summary(),
                     }
+                    yield {
+                        "type": "meta",
+                        "level": 1,
+                        "funnel_res": res["funnel_res"],
+                        "tier_profile": tier_profile_1,
+                        "docs": [],
+                        "recalled_memories": [],
+                        "access_denied": False,
+                        "blocked_docs_count": 0,
+                        "skipped_retrieval": True,
+                    }
+                    yield {"type": "content", "delta": ans, "replace": True}
+                    yield {"type": "done", "result": res}
+                    return
 
-        # 1. 渐进式漏斗路由裁决 (附带算力画像与防破产记录)
+        # 1. 渐进式漏斗路由裁决
         funnel_res = ProgressiveFunnelRouter.route(query, session)
         level = funnel_res["level"]
-        actual_query = funnel_res.get("rewritten_query", query)
         tier_profile = funnel_res.get("tier_profile", MODEL_TIER_PROFILES.get(level, {}))
 
         # -------------------------------------------------------------
-        # Level 1: 规则层 - 分诊台 (0 大模型算力，<1ms 秒回，0 Token 成本，旁路检索)
+        # Level 1: 规则层 - 分诊台（秒回）
         # -------------------------------------------------------------
         if level == 1:
             t_gen_start = time.time()
             ans = ProgressiveFunnelRouter.get_triage_reply(query, funnel_res)
             gen_time = time.time() - t_gen_start
-            
-            session.add_turn("user", query, level=1, stage="规则分诊直通", original_query=query, rewritten_query=query, model="规则分诊(0大模型算力)", total_time=round(time.time() - start_total, 3), docs_count=0)
-            session.add_turn("assistant", ans, level=1, stage="规则分诊直通", original_query=query, rewritten_query=query, model="规则分诊(0大模型算力)", total_time=round(time.time() - start_total, 3), docs_count=0)
+            _tot = round(time.time() - start_total, 4)
 
-            return {
+            session.add_turn("user", query, level=1, stage="规则分诊直通", original_query=query, rewritten_query=query, model="规则分诊(0大模型算力)", total_time=_tot, docs_count=0)
+            session.add_turn("assistant", ans, level=1, stage="规则分诊直通", original_query=query, rewritten_query=query, model="规则分诊(0大模型算力)", total_time=_tot, docs_count=0)
+
+            res = {
                 "level": 1,
                 "funnel_res": funnel_res,
                 "tier_profile": tier_profile,
@@ -606,50 +852,112 @@ class EnterpriseRAGPipeline:
                 "conflict_matrix": [],
                 "retrieve_time": 0.0,
                 "gen_time": round(gen_time, 4),
-                "total_time": round(time.time() - start_total, 4),
+                "total_time": _tot,
                 "skipped_retrieval": True,
                 "access_denied": False,
                 "blocked_docs_count": 0,
+                "rewritten_query": query,
+                "search_queries": [query],
+                "rewrite_used": False,
+                "rewrite_reason": "level1_triage",
                 "history_messages_count": 0,
                 "summary_updated": False,
                 "rolling_summary": session.rolling_summary,
                 "recalled_memories": [],
                 "memory_events": memory_events,
-                "session_summary": session.get_summary()
+                "session_summary": session.get_summary(),
             }
+            yield {
+                "type": "meta",
+                "level": 1,
+                "funnel_res": funnel_res,
+                "tier_profile": tier_profile,
+                "docs": [],
+                "recalled_memories": [],
+                "access_denied": False,
+                "blocked_docs_count": 0,
+                "skipped_retrieval": True,
+            }
+            yield {"type": "content", "delta": ans, "replace": True}
+            yield {"type": "done", "result": res}
+            return
 
         # -------------------------------------------------------------
-        # Level 2: 上下文层 - 专科门诊 (轻量化 SLM，原生多轮 + 长期记忆 + 检索前强权限过滤 RAG)
+        # Level 2: 上下文层 - 专科门诊（流式输出）
         # -------------------------------------------------------------
-        elif level == 2:
-            needs_rag = funnel_res.get("needs_rag", True)
-            docs = []
+        if level == 2:
+            if enable_query_rewrite:
+                yield {"type": "status", "text": "✨ 正在理解上下文并优化检索问题..."}
+
+            rw_info = self._run_query_rewrite(
+                query=query,
+                session=session,
+                funnel_res=funnel_res,
+                enable_query_rewrite=enable_query_rewrite,
+                confidence_threshold=rewrite_confidence_threshold,
+            )
+            actual_query = rw_info["actual_query"]
+            search_queries = rw_info["search_queries"]
+            query_weights = rw_info["query_weights"]
+            rewrite_used = rw_info["rewrite_used"]
+            rewrite_reason = rw_info["rewrite_reason"]
+            rewrite_confidence = rw_info["rewrite_confidence"]
+            rewrite_status = rw_info["rewrite_status"]
+            reject_reason = rw_info["reject_reason"]
+            candidate_rewritten_query = rw_info["candidate_rewritten_query"]
+            needs_rag = rw_info["needs_rag"]
+            funnel_res["rewritten_query"] = actual_query
+            funnel_res["search_queries"] = search_queries
+            funnel_res["history_used"] = bool(funnel_res.get("history_used") or (actual_query != query))
+            funnel_res["rewrite_reason"] = rewrite_reason
+            funnel_res["rewrite_confidence"] = rewrite_confidence
+            funnel_res["rewrite_status"] = rewrite_status
+
+            yield {
+                "type": "rewrite",
+                "original_query": query,
+                "rewritten_query": actual_query,
+                "candidate_rewritten_query": candidate_rewritten_query,
+                "search_queries": search_queries,
+                "rewrite_used": rewrite_used,
+                "rewrite_reason": rewrite_reason,
+                "rewrite_confidence": rewrite_confidence,
+                "rewrite_status": rewrite_status,
+                "reject_reason": reject_reason,
+            }
+
+            docs: List[Dict[str, Any]] = []
             ret_time = 0.0
             blocked_docs_count = 0
 
-            # 即使路由判定为普通对话，若显式提及受限敏感数据源/工单也进行越权门禁校验
+            # 改写后统一过 RBAC 显式受限目标门禁（封堵用代词“它”绕过关键词检测）
             if user_ctx is not None and not user_ctx.is_admin:
-                explicit_restricted = self._detect_restricted_target(actual_query, user_ctx)
-                if explicit_restricted:
-                    if not self.is_initialized:
-                        self.initialize()
-                    b_cnt, _, _ = self.bm25_retriever.probe_blocked_scores(actual_query, user_ctx)
-                    return self._build_denied_result(
-                        query=query,
-                        session=session,
-                        user_ctx=user_ctx,
-                        reason_label=explicit_restricted,
-                        start_total=start_total,
-                        blocked_docs_count=b_cnt,
-                        memory_events=memory_events,
-                    )
+                check_pool = [query, actual_query] + list(search_queries)
+                if rewrite_status == "soft_fallback" and candidate_rewritten_query:
+                    check_pool.append(candidate_rewritten_query)
+                for q_check in check_pool:
+                    explicit_restricted = self._detect_restricted_target(q_check, user_ctx)
+                    if explicit_restricted:
+                        if not self.is_initialized:
+                            self.initialize()
+                        b_cnt, _, _ = self.bm25_retriever.probe_blocked_scores(actual_query, user_ctx)
+                        denied_res = self._build_denied_result(
+                            query=query,
+                            session=session,
+                            user_ctx=user_ctx,
+                            reason_label=explicit_restricted,
+                            start_total=start_total,
+                            blocked_docs_count=b_cnt,
+                            memory_events=memory_events,
+                        )
+                        yield from _emit_denied(denied_res)
+                        return
 
             if needs_rag:
-                # 校验显式数据源过滤是否越权
                 if user_ctx is not None and source_filter and not user_ctx.is_admin:
                     if source_filter.lower().strip() not in user_ctx.allowed_sources:
                         src_label = SOURCE_TYPE_LABELS.get(source_filter.lower().strip(), source_filter)
-                        return self._build_denied_result(
+                        denied_res = self._build_denied_result(
                             query=query,
                             session=session,
                             user_ctx=user_ctx,
@@ -658,29 +966,32 @@ class EnterpriseRAGPipeline:
                             blocked_docs_count=1,
                             memory_events=memory_events,
                         )
+                        yield from _emit_denied(denied_res)
+                        return
 
+                yield {"type": "status", "text": "🔍 正在按权限执行企业知识库检索..."}
                 t_ret_start = time.time()
-                docs = self.retrieve(
-                    actual_query,
+                docs = self.retrieve_multi_query(
+                    search_queries,
                     top_k=top_k,
                     mode=mode,
                     domain_filter=domain_filter,
                     source_filter=source_filter,
                     user_ctx=user_ctx,
+                    query_weights=query_weights,
                 )
                 ret_time = time.time() - t_ret_start
 
-                # 静默安全探针：检测是否因权限不足导致真实匹配文档全部被屏蔽
                 if user_ctx is not None and not user_ctx.is_admin:
                     blocked_docs_count, top_blocked_s, top_allowed_s = self.bm25_retriever.probe_blocked_scores(
-                        actual_query, user_ctx
+                        " ".join(search_queries), user_ctx
                     )
                     if (len(docs) == 0 and blocked_docs_count > 0) or (
                         blocked_docs_count > 0 and top_blocked_s >= 4.0 and top_allowed_s < 1.5
                     ) or (
                         blocked_docs_count > 0 and top_blocked_s >= 6.0 and top_blocked_s > top_allowed_s * 2.2
                     ):
-                        return self._build_denied_result(
+                        denied_res = self._build_denied_result(
                             query=query,
                             session=session,
                             user_ctx=user_ctx,
@@ -689,6 +1000,8 @@ class EnterpriseRAGPipeline:
                             blocked_docs_count=blocked_docs_count,
                             memory_events=memory_events,
                         )
+                        yield from _emit_denied(denied_res)
+                        return
 
                 if self.auth_manager is not None and user_ctx is not None:
                     self.auth_manager.log_audit(
@@ -698,10 +1011,9 @@ class EnterpriseRAGPipeline:
                         query_text=query,
                         allowed_docs_count=len(docs),
                         blocked_docs_count=blocked_docs_count,
-                        detail=f"检索放行（模式: {mode}, 召回授权文档: {len(docs)} 篇, 前置过滤拦截: {blocked_docs_count} 篇）",
+                        detail=f"流式检索放行（模式: {mode}, 查询数: {len(search_queries)}, 召回授权片段: {len(docs)}, 前置过滤拦截: {blocked_docs_count}）",
                     )
 
-            t_gen_start = time.time()
             history_messages = session.get_recent_messages(max_turns=6)
             memory_context, recalled_memories = self._build_memory_context(
                 session=session,
@@ -713,26 +1025,62 @@ class EnterpriseRAGPipeline:
             if len(session.history) > 0:
                 history_context = "[既往就诊病史记录 History Memory]:\n" + session.get_history_memory(max_turns=6) + "\n\n"
 
-            # 调度轻量级 SLM 生成器（原生多轮 messages + 长期记忆 + 滚动摘要）
-            slm_res = self.generator.generate_lightweight_answer(
-                query=actual_query,
-                context_docs=docs if needs_rag else [],
-                history_context=history_context,
-                history_messages=history_messages,
-                memory_context=memory_context
-            )
-            raw_ans = slm_res.get("content", "")
-            
-            if "[DeepSeek Error]" in raw_ans or not raw_ans.strip():
+            yield {
+                "type": "meta",
+                "level": 2,
+                "funnel_res": funnel_res,
+                "tier_profile": tier_profile,
+                "docs": docs,
+                "recalled_memories": recalled_memories,
+                "access_denied": False,
+                "blocked_docs_count": blocked_docs_count,
+                "skipped_retrieval": not needs_rag,
+            }
+            yield {"type": "status", "text": "⚡ 正在流式生成回答..."}
+
+            t_gen_start = time.time()
+            raw_ans = ""
+            stream_err = None
+            if stream:
+                raw_chunks: List[str] = []
+                for ev in self.generator.generate_lightweight_stream(
+                    query=actual_query,
+                    context_docs=docs if needs_rag else [],
+                    history_context=history_context,
+                    history_messages=history_messages,
+                    memory_context=memory_context,
+                ):
+                    ev_type = ev.get("type")
+                    if ev_type == "content":
+                        delta = ev.get("delta", "")
+                        if delta:
+                            raw_chunks.append(delta)
+                            yield {"type": "content", "delta": delta, "replace": False}
+                    elif ev_type == "error":
+                        stream_err = ev.get("error") or "Unknown streaming error"
+                raw_ans = "".join(raw_chunks)
+            else:
+                slm_res = self.generator.generate_lightweight_answer(
+                    query=actual_query,
+                    context_docs=docs if needs_rag else [],
+                    history_context=history_context,
+                    history_messages=history_messages,
+                    memory_context=memory_context,
+                )
+                raw_ans = slm_res.get("content", "")
+                stream_err = slm_res.get("error")
+
+            if stream_err or "[DeepSeek Error]" in raw_ans or not raw_ans.strip():
                 if needs_rag:
                     ans = self._fallback_specialist_answer(actual_query, docs, session)
                 else:
-                    ans = self._fallback_general_answer(actual_query, slm_res.get("error", raw_ans))
+                    ans = self._fallback_general_answer(actual_query, stream_err or raw_ans)
+                if stream:
+                    yield {"type": "content", "delta": ans, "replace": True}
             else:
                 ans = raw_ans
             gen_time = time.time() - t_gen_start
 
-            # 更新会话历史，按需触发滚动摘要压缩与混合触发长期记忆抽取
             _tot = round(time.time() - start_total, 3)
             turn_stage = session.active_stage if needs_rag else "大模型直接问答"
             session.add_turn("user", query, level=2, stage=turn_stage, original_query=query, rewritten_query=actual_query, history_used=funnel_res.get("history_used", False), model=tier_profile.get("model", "deepseek-chat"), total_time=_tot, docs_count=len(docs))
@@ -752,7 +1100,7 @@ class EnterpriseRAGPipeline:
                 except Exception:
                     pass
 
-            return {
+            result = {
                 "level": 2,
                 "funnel_res": funnel_res,
                 "tier_profile": tier_profile,
@@ -767,36 +1115,90 @@ class EnterpriseRAGPipeline:
                 "skipped_retrieval": not needs_rag,
                 "access_denied": False,
                 "blocked_docs_count": blocked_docs_count,
+                "rewritten_query": actual_query,
+                "candidate_rewritten_query": candidate_rewritten_query,
+                "search_queries": search_queries,
+                "rewrite_used": rewrite_used,
+                "rewrite_reason": rewrite_reason,
+                "rewrite_confidence": rewrite_confidence,
+                "rewrite_status": rewrite_status,
+                "reject_reason": reject_reason,
                 "history_messages_count": len(history_messages),
                 "summary_updated": summary_updated,
                 "rolling_summary": session.rolling_summary,
                 "recalled_memories": recalled_memories,
                 "memory_events": memory_events,
-                "session_summary": session.get_summary()
+                "session_summary": session.get_summary(),
             }
+            yield {"type": "done", "result": result}
+            return
 
         # -------------------------------------------------------------
-        # Level 3: 工具兜底层 - 多科室联合会诊 (仅授权角色可调用，检索前强过滤)
+        # Level 3: 工具兜底层 - 多科室联合会诊（双流式：CoT 思维链 + 正文）
         # -------------------------------------------------------------
-        else:
-            if user_ctx is not None and not user_ctx.can_use_level3:
-                return self._build_denied_result(
-                    query=query,
-                    session=session,
-                    user_ctx=user_ctx,
-                    reason_label="Level 3 多科室联合会诊与跨源决策能力",
-                    start_total=start_total,
-                    blocked_docs_count=1,
-                    memory_events=memory_events,
-                )
+        if user_ctx is not None and not user_ctx.can_use_level3:
+            denied_res = self._build_denied_result(
+                query=query,
+                session=session,
+                user_ctx=user_ctx,
+                reason_label="Level 3 多科室联合会诊与跨源决策能力",
+                start_total=start_total,
+                blocked_docs_count=1,
+                memory_events=memory_events,
+            )
+            yield from _emit_denied(denied_res)
+            return
 
-            if user_ctx is not None and not user_ctx.is_admin:
-                explicit_restricted = self._detect_restricted_target(actual_query, user_ctx)
+        if enable_query_rewrite:
+            yield {"type": "status", "text": "✨ 正在理解上下文并拆解多源检索问题..."}
+
+        rw_info = self._run_query_rewrite(
+            query=query,
+            session=session,
+            funnel_res=funnel_res,
+            enable_query_rewrite=enable_query_rewrite,
+            confidence_threshold=rewrite_confidence_threshold,
+        )
+        actual_query = rw_info["actual_query"]
+        search_queries = rw_info["search_queries"]
+        query_weights = rw_info["query_weights"]
+        rewrite_used = rw_info["rewrite_used"]
+        rewrite_reason = rw_info["rewrite_reason"]
+        rewrite_confidence = rw_info["rewrite_confidence"]
+        rewrite_status = rw_info["rewrite_status"]
+        reject_reason = rw_info["reject_reason"]
+        candidate_rewritten_query = rw_info["candidate_rewritten_query"]
+        funnel_res["rewritten_query"] = actual_query
+        funnel_res["search_queries"] = search_queries
+        funnel_res["history_used"] = bool(funnel_res.get("history_used") or (actual_query != query))
+        funnel_res["rewrite_reason"] = rewrite_reason
+        funnel_res["rewrite_confidence"] = rewrite_confidence
+        funnel_res["rewrite_status"] = rewrite_status
+
+        yield {
+            "type": "rewrite",
+            "original_query": query,
+            "rewritten_query": actual_query,
+            "candidate_rewritten_query": candidate_rewritten_query,
+            "search_queries": search_queries,
+            "rewrite_used": rewrite_used,
+            "rewrite_reason": rewrite_reason,
+            "rewrite_confidence": rewrite_confidence,
+            "rewrite_status": rewrite_status,
+            "reject_reason": reject_reason,
+        }
+
+        if user_ctx is not None and not user_ctx.is_admin:
+            check_pool = [query, actual_query] + list(search_queries)
+            if rewrite_status == "soft_fallback" and candidate_rewritten_query:
+                check_pool.append(candidate_rewritten_query)
+            for q_check in check_pool:
+                explicit_restricted = self._detect_restricted_target(q_check, user_ctx)
                 if explicit_restricted:
                     if not self.is_initialized:
                         self.initialize()
                     b_cnt, _, _ = self.bm25_retriever.probe_blocked_scores(actual_query, user_ctx)
-                    return self._build_denied_result(
+                    denied_res = self._build_denied_result(
                         query=query,
                         session=session,
                         user_ctx=user_ctx,
@@ -805,116 +1207,183 @@ class EnterpriseRAGPipeline:
                         blocked_docs_count=b_cnt,
                         memory_events=memory_events,
                     )
+                    yield from _emit_denied(denied_res)
+                    return
 
-            t_ret_start = time.time()
-            # 会诊需要更加广泛的多源事实支撑 (top_k >= 6)，依然严格受 user_ctx 检索前过滤约束
-            docs = self.retrieve(
-                actual_query,
-                top_k=max(top_k, 6),
-                mode=mode,
-                domain_filter=domain_filter,
-                source_filter=source_filter,
-                user_ctx=user_ctx,
+        yield {"type": "status", "text": "🔍 正在按权限跨源检索多科室证据..."}
+        t_ret_start = time.time()
+        docs = self.retrieve_multi_query(
+            search_queries,
+            top_k=max(top_k, 6),
+            mode=mode,
+            domain_filter=domain_filter,
+            source_filter=source_filter,
+            user_ctx=user_ctx,
+            query_weights=query_weights,
+        )
+        ret_time = time.time() - t_ret_start
+
+        blocked_docs_count = 0
+        if user_ctx is not None and not user_ctx.is_admin:
+            blocked_docs_count, top_blocked_s, top_allowed_s = self.bm25_retriever.probe_blocked_scores(
+                " ".join(search_queries), user_ctx
             )
-            ret_time = time.time() - t_ret_start
-
-            blocked_docs_count = 0
-            if user_ctx is not None and not user_ctx.is_admin:
-                blocked_docs_count, top_blocked_s, top_allowed_s = self.bm25_retriever.probe_blocked_scores(
-                    actual_query, user_ctx
-                )
-                if (len(docs) == 0 and blocked_docs_count > 0) or (
-                    blocked_docs_count > 0 and top_blocked_s >= 5.0 and top_allowed_s < 1.5
-                ):
-                    return self._build_denied_result(
-                        query=query,
-                        session=session,
-                        user_ctx=user_ctx,
-                        reason_label="跨源高密级会诊证据文档",
-                        start_total=start_total,
-                        blocked_docs_count=blocked_docs_count,
-                        memory_events=memory_events,
-                    )
-
-            if self.auth_manager is not None and user_ctx is not None:
-                self.auth_manager.log_audit(
-                    user=user_ctx,
-                    action="RAG_LEVEL3_QUERY",
-                    status="ALLOW",
-                    query_text=query,
-                    allowed_docs_count=len(docs),
+            if (len(docs) == 0 and blocked_docs_count > 0) or (
+                blocked_docs_count > 0 and top_blocked_s >= 5.0 and top_allowed_s < 1.5
+            ):
+                denied_res = self._build_denied_result(
+                    query=query,
+                    session=session,
+                    user_ctx=user_ctx,
+                    reason_label="跨源高密级会诊证据文档",
+                    start_total=start_total,
                     blocked_docs_count=blocked_docs_count,
-                    detail=f"Level 3 会诊放行（召回授权文档: {len(docs)} 篇, 前置拦截: {blocked_docs_count} 篇）",
+                    memory_events=memory_events,
                 )
+                yield from _emit_denied(denied_res)
+                return
 
-            t_gen_start = time.time()
-            history_messages = session.get_recent_messages(max_turns=6)
-            memory_context, recalled_memories = self._build_memory_context(
-                session=session,
-                query=actual_query,
-                user_id=user_id,
-                use_long_term_memory=use_long_term_memory,
+        if self.auth_manager is not None and user_ctx is not None:
+            self.auth_manager.log_audit(
+                user=user_ctx,
+                action="RAG_LEVEL3_QUERY",
+                status="ALLOW",
+                query_text=query,
+                allowed_docs_count=len(docs),
+                blocked_docs_count=blocked_docs_count,
+                detail=f"Level 3 流式会诊放行（查询数: {len(search_queries)}, 召回授权片段: {len(docs)}, 前置拦截: {blocked_docs_count}）",
             )
-            history_context = ""
-            if len(session.history) > 0:
-                history_context = "[跨系统联合会诊前序事实记录]:\n" + session.get_history_memory(max_turns=6) + "\n\n"
 
-            # 调度重型推理 LLM 生成器 (DeepSeek-Reasoner / R1 CoT)
+        history_messages = session.get_recent_messages(max_turns=6)
+        memory_context, recalled_memories = self._build_memory_context(
+            session=session,
+            query=actual_query,
+            user_id=user_id,
+            use_long_term_memory=use_long_term_memory,
+        )
+        history_context = ""
+        if len(session.history) > 0:
+            history_context = "[跨系统联合会诊前序事实记录]:\n" + session.get_history_memory(max_turns=6) + "\n\n"
+
+        yield {
+            "type": "meta",
+            "level": 3,
+            "funnel_res": funnel_res,
+            "tier_profile": tier_profile,
+            "docs": docs,
+            "recalled_memories": recalled_memories,
+            "access_denied": False,
+            "blocked_docs_count": blocked_docs_count,
+            "skipped_retrieval": False,
+        }
+        yield {"type": "status", "text": "🧠 正在启动深度推理思维链与跨源会诊..."}
+
+        t_gen_start = time.time()
+        if stream:
+            done_ev: Dict[str, Any] = {}
+            content_buf: List[str] = []
+            reasoning_buf: List[str] = []
+
+            for ev in self.generator.generate_heavy_reasoning_stream(
+                query=actual_query,
+                context_docs=docs,
+                history_context=history_context,
+                history_messages=history_messages,
+                memory_context=memory_context,
+            ):
+                ev_type = ev.get("type")
+                if ev_type == "reasoning":
+                    delta = ev.get("delta", "")
+                    is_rep = bool(ev.get("replace", False))
+                    if is_rep:
+                        reasoning_buf = [delta]
+                    elif delta:
+                        reasoning_buf.append(delta)
+                    if delta:
+                        yield {"type": "reasoning", "delta": delta, "replace": is_rep}
+                elif ev_type == "content":
+                    delta = ev.get("delta", "")
+                    is_rep = bool(ev.get("replace", False))
+                    if is_rep:
+                        content_buf = [delta]
+                    elif delta:
+                        content_buf.append(delta)
+                    if delta:
+                        yield {"type": "content", "delta": delta, "replace": is_rep}
+                elif ev_type == "done":
+                    done_ev = ev
+
+            raw_ans = done_ev.get("content") or "".join(content_buf)
+            reasoning_cot = done_ev.get("reasoning_content") or "".join(reasoning_buf)
+            tool_traces = done_ev.get("tool_traces", [])
+            conflict_matrix = done_ev.get("conflict_matrix", [])
+        else:
             reasoning_res = self.generator.generate_heavy_reasoning(
                 query=actual_query,
                 context_docs=docs,
                 history_context=history_context,
                 history_messages=history_messages,
-                memory_context=memory_context
+                memory_context=memory_context,
             )
             raw_ans = reasoning_res.get("content") or reasoning_res.get("text", "")
             reasoning_cot = reasoning_res.get("reasoning_content", "")
             tool_traces = reasoning_res.get("tool_traces", [])
             conflict_matrix = reasoning_res.get("conflict_matrix", [])
 
-            if "[DeepSeek Error]" in raw_ans or not raw_ans.strip():
-                ans = self._fallback_joint_consultation(actual_query, docs, session)
-            else:
-                ans = raw_ans
-            gen_time = time.time() - t_gen_start
+        if "[DeepSeek Error]" in raw_ans or not raw_ans.strip():
+            ans = self._fallback_joint_consultation(actual_query, docs, session)
+            if stream:
+                yield {"type": "content", "delta": ans, "replace": True}
+        else:
+            ans = raw_ans
+        gen_time = time.time() - t_gen_start
 
-            _tot = round(time.time() - start_total, 3)
-            session.add_turn("user", query, level=3, stage="多科室联合会诊与仲裁", original_query=query, rewritten_query=actual_query, history_used=funnel_res.get("history_used", False), model=tier_profile.get("model", "deepseek-reasoner"), total_time=_tot, docs_count=len(docs))
-            session.add_turn("assistant", ans, level=3, stage="多科室联合会诊与仲裁", original_query=query, rewritten_query=actual_query, model=tier_profile.get("model", "deepseek-reasoner"), total_time=_tot, docs_count=len(docs))
-            summary_updated = self._maybe_compress_session_history(session)
+        _tot = round(time.time() - start_total, 3)
+        session.add_turn("user", query, level=3, stage="多科室联合会诊与仲裁", original_query=query, rewritten_query=actual_query, history_used=funnel_res.get("history_used", False), model=tier_profile.get("model", "deepseek-reasoner"), total_time=_tot, docs_count=len(docs))
+        session.add_turn("assistant", ans, level=3, stage="多科室联合会诊与仲裁", original_query=query, rewritten_query=actual_query, model=tier_profile.get("model", "deepseek-reasoner"), total_time=_tot, docs_count=len(docs))
+        summary_updated = self._maybe_compress_session_history(session)
 
-            if self.memory_manager is not None and auto_extract_memory and not explicit_mem_consumed:
-                try:
-                    extracted_events = self.memory_manager.maybe_extract_and_save(
-                        query=query,
-                        answer=ans,
-                        user_id=user_id,
-                        session_id=session.session_id,
-                        auto_extract=auto_extract_memory,
-                    )
-                    memory_events.extend(extracted_events)
-                except Exception:
-                    pass
+        if self.memory_manager is not None and auto_extract_memory and not explicit_mem_consumed:
+            try:
+                extracted_events = self.memory_manager.maybe_extract_and_save(
+                    query=query,
+                    answer=ans,
+                    user_id=user_id,
+                    session_id=session.session_id,
+                    auto_extract=auto_extract_memory,
+                )
+                memory_events.extend(extracted_events)
+            except Exception:
+                pass
 
-            return {
-                "level": 3,
-                "funnel_res": funnel_res,
-                "tier_profile": tier_profile,
-                "docs": docs,
-                "answer": ans,
-                "reasoning_content": reasoning_cot,
-                "tool_traces": tool_traces,
-                "conflict_matrix": conflict_matrix,
-                "retrieve_time": round(ret_time, 3),
-                "gen_time": round(gen_time, 3),
-                "total_time": round(time.time() - start_total, 3),
-                "skipped_retrieval": False,
-                "access_denied": False,
-                "blocked_docs_count": blocked_docs_count,
-                "history_messages_count": len(history_messages),
-                "summary_updated": summary_updated,
-                "rolling_summary": session.rolling_summary,
-                "recalled_memories": recalled_memories,
-                "memory_events": memory_events,
-                "session_summary": session.get_summary()
-            }
+        result = {
+            "level": 3,
+            "funnel_res": funnel_res,
+            "tier_profile": tier_profile,
+            "docs": docs,
+            "answer": ans,
+            "reasoning_content": reasoning_cot,
+            "tool_traces": tool_traces,
+            "conflict_matrix": conflict_matrix,
+            "retrieve_time": round(ret_time, 3),
+            "gen_time": round(gen_time, 3),
+            "total_time": round(time.time() - start_total, 3),
+            "skipped_retrieval": False,
+            "access_denied": False,
+            "blocked_docs_count": blocked_docs_count,
+            "rewritten_query": actual_query,
+            "candidate_rewritten_query": candidate_rewritten_query,
+            "search_queries": search_queries,
+            "rewrite_used": rewrite_used,
+            "rewrite_reason": rewrite_reason,
+            "rewrite_confidence": rewrite_confidence,
+            "rewrite_status": rewrite_status,
+            "reject_reason": reject_reason,
+            "history_messages_count": len(history_messages),
+            "summary_updated": summary_updated,
+            "rolling_summary": session.rolling_summary,
+            "recalled_memories": recalled_memories,
+            "memory_events": memory_events,
+            "session_summary": session.get_summary(),
+        }
+        yield {"type": "done", "result": result}
